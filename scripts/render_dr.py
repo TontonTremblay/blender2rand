@@ -446,6 +446,11 @@ def add_flying_distractors(n_min, n_max, texture_files):
         if use_usdc:
             usdc_path = str(random.choice(usdc_files))
             # Import USDC from its own directory so relative texture paths resolve
+            # Save frame range — USD import resets it
+            scene = bpy.context.scene
+            orig_frame_start = scene.frame_start
+            orig_frame_end = scene.frame_end
+            orig_fps = scene.render.fps
             existing = set(bpy.data.objects.keys())
             orig_cwd = os.getcwd()
             try:
@@ -455,6 +460,10 @@ def add_flying_distractors(n_min, n_max, texture_files):
                 use_usdc = False
             finally:
                 os.chdir(orig_cwd)
+                # Restore frame range
+                scene.frame_start = orig_frame_start
+                scene.frame_end = orig_frame_end
+                scene.render.fps = orig_fps
             
             if use_usdc:
                 new_objs = [o for o in bpy.data.objects if o.name not in existing and o.type == 'MESH']
