@@ -69,8 +69,8 @@ def parse_args():
                         help="Render as video (mp4) instead of image sequence")
     parser.add_argument("--frame_step", type=int, default=1,
                         help="Render every N frames")
-    parser.add_argument("--n_distractors_min", type=int, default=3)
-    parser.add_argument("--n_distractors_max", type=int, default=10)
+    parser.add_argument("--n_distractors_min", type=int, default=5)
+    parser.add_argument("--n_distractors_max", type=int, default=15)
     parser.add_argument("--use_gpu", action="store_true", default=True)
     
     return parser.parse_args(argv)
@@ -183,94 +183,25 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
 
 
 def randomize_robot_material(texture_files):
-    """Randomize robot material - aggressive DR on appearance."""
-    # Strategy: randomly choose between:
-    # 1. Uniform random color (most common for DR)
-    # 2. Metallic robot look
-    # 3. Random texture
-    # 4. Per-part random colors
-    
-    strategy = random.choice(['uniform_color', 'metallic', 'textured', 'per_part', 'dark_robot'])
+    """Randomize robot material PER LINK — each robot part gets its own random material.
+    Heavily favors textures for aggressive DR (per MolmoBot: diversity > photorealism)."""
     
     robot_objects = [obj for obj in bpy.data.objects if 'robot' in obj.name and obj.type == 'MESH']
     
-    # DR reference tip 4: "Don't randomize away the cues the task actually depends on"
-    # The robot MUST remain visible (opaque, non-mirror) for a vision-based policy.
-    # Constraint: roughness >= 0.3 (no pure mirrors), transmission = 0, alpha = 1.
-    
-    def _ensure_opaque(bsdf):
-        """Ensure material is fully opaque and non-transmissive."""
-        bsdf.inputs['Alpha'].default_value = 1.0
-        if 'Transmission Weight' in bsdf.inputs:
-            bsdf.inputs['Transmission Weight'].default_value = 0.0
-    
-    if strategy == 'uniform_color':
-        color = rand_color()
-        mat = bpy.data.materials.new(name="robot_dr")
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get('Principled BSDF')
-        if bsdf:
-            bsdf.inputs['Base Color'].default_value = color
-            bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.3, 0.9)
-            _ensure_opaque(bsdf)
-        for obj in robot_objects:
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
-    
-    elif strategy == 'metallic':
-        mat = bpy.data.materials.new(name="robot_metallic_dr")
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get('Principled BSDF')
-        if bsdf:
-            # Metallic but still diffuse enough to be visible
-            val = rand_range(0.15, 0.6)
-            bsdf.inputs['Base Color'].default_value = (val, val, val, 1.0)
-            bsdf.inputs['Metallic'].default_value = rand_range(0.5, 0.9)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.3, 0.6)
-            _ensure_opaque(bsdf)
-        for obj in robot_objects:
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
-    
-    elif strategy == 'textured' and texture_files:
-        tex = random.choice(texture_files)
-        mat = create_random_material("robot_tex", texture_path=str(tex))
-        for obj in robot_objects:
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
-    
-    elif strategy == 'per_part':
-        for obj in robot_objects:
-            color = rand_color()
-            mat = bpy.data.materials.new(name=f"robot_part_{obj.name}")
-            mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get('Principled BSDF')
-            if bsdf:
-                bsdf.inputs['Base Color'].default_value = color
-                bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
-                bsdf.inputs['Roughness'].default_value = rand_range(0.3, 1.0)
-                _ensure_opaque(bsdf)
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
-    
-    elif strategy == 'dark_robot':
-        mat = bpy.data.materials.new(name="robot_dark_dr")
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get('Principled BSDF')
-        if bsdf:
-            val = rand_range(0.05, 0.2)
-            bsdf.inputs['Base Color'].default_value = (val, val * rand_range(0.8, 1.2), val * rand_range(0.8, 1.2), 1.0)
-            bsdf.inputs['Metallic'].default_value = rand_range(0.3, 0.7)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.4, 0.8)
-            _ensure_opaque(bsdf)
-        for obj in robot_objects:
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
+    for obj in robot_objects:
+        # Each link gets an independent random material
+        # 70% chance texture, 30% chance solid color
+        if texture_files and random.random() < 0.7:
+            tex = random.choice(texture_files)
+            mat = create_random_material(f"robot_{obj.name}", texture_path=str(tex))
+        else:
+            mat = create_random_material(f"robot_{obj.name}")
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
 
 
 def randomize_table_material(texture_files):
-    """Randomize table and floor materials."""
+    """Randomize table, floor, and backdrop — heavily favor textures."""
     table_objects = [obj for obj in bpy.data.objects 
                      if obj.type == 'MESH' and ('table' in obj.name or 'leg' in obj.name)]
     floor_objects = [obj for obj in bpy.data.objects 
@@ -278,8 +209,8 @@ def randomize_table_material(texture_files):
     backdrop_objects = [obj for obj in bpy.data.objects 
                         if obj.type == 'MESH' and 'backdrop' in obj.name]
     
-    # Table
-    if texture_files and random.random() > 0.3:
+    # Table — 80% textured
+    if texture_files and random.random() < 0.8:
         tex = random.choice(texture_files)
         mat = create_random_material("table_dr", texture_path=str(tex))
     else:
@@ -288,8 +219,8 @@ def randomize_table_material(texture_files):
         obj.data.materials.clear()
         obj.data.materials.append(mat)
     
-    # Floor
-    if texture_files and random.random() > 0.3:
+    # Floor — 80% textured
+    if texture_files and random.random() < 0.8:
         tex = random.choice(texture_files)
         mat = create_random_material("floor_dr", texture_path=str(tex))
     else:
@@ -298,8 +229,8 @@ def randomize_table_material(texture_files):
         obj.data.materials.clear()
         obj.data.materials.append(mat)
     
-    # Backdrop
-    if texture_files and random.random() > 0.5:
+    # Backdrop — 80% textured
+    if texture_files and random.random() < 0.8:
         tex = random.choice(texture_files)
         mat = create_random_material("backdrop_dr", texture_path=str(tex))
     else:
@@ -310,12 +241,12 @@ def randomize_table_material(texture_files):
 
 
 def randomize_object_material(texture_files):
-    """Randomize the hope_object (target object) material."""
+    """Randomize the hope_object (target object) material — 80% textured."""
     obj = bpy.data.objects.get('hope_object')
     if not obj:
         return
     
-    if texture_files and random.random() > 0.4:
+    if texture_files and random.random() < 0.8:
         tex = random.choice(texture_files)
         mat = create_random_material("object_dr", texture_path=str(tex))
     else:
