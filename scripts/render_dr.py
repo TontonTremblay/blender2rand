@@ -404,7 +404,11 @@ def randomize_camera():
 # ============================================================
 
 def add_flying_distractors(n_min, n_max, texture_files):
-    """Add random geometric shapes floating in the scene as distractors."""
+    """Add flying distractors: mix of primitives and real objects from meta_assets_2k.
+    
+    Objects are scaled so they never dominate the frame — size is capped
+    relative to distance from camera (closer = smaller).
+    """
     # Remove existing distractors
     for obj in list(bpy.data.objects):
         if obj.name.startswith("DR_Distractor"):
@@ -412,33 +416,67 @@ def add_flying_distractors(n_min, n_max, texture_files):
     
     n = random.randint(n_min, n_max)
     
-    primitives = ['cube', 'sphere', 'cylinder', 'cone', 'torus', 'monkey']
+    # Find USDC distractor files
+    script_dir = Path(__file__).parent
+    project_dir = script_dir.parent
+    distractor_dir = project_dir / "assets" / "distractors"
+    usdc_files = list(distractor_dir.glob("*.usdc")) if distractor_dir.exists() else []
+    
+    # Get camera location for distance-based scaling
+    cam = bpy.data.objects.get('Camera')
+    cam_loc = cam.location.copy() if cam else Vector((0, 1.5, 1.35))
+    
+    primitives = ['cube', 'sphere', 'cylinder', 'cone', 'torus']
     
     for i in range(n):
-        prim = random.choice(primitives)
+        # 50% chance to use a real object from meta_assets_2k if available
+        use_usdc = usdc_files and random.random() < 0.5
         
-        # Create primitive
-        if prim == 'cube':
-            bpy.ops.mesh.primitive_cube_add()
-        elif prim == 'sphere':
-            bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8)
-        elif prim == 'cylinder':
-            bpy.ops.mesh.primitive_cylinder_add(vertices=16)
-        elif prim == 'cone':
-            bpy.ops.mesh.primitive_cone_add(vertices=16)
-        elif prim == 'torus':
-            bpy.ops.mesh.primitive_torus_add()
-        elif prim == 'monkey':
-            bpy.ops.mesh.primitive_monkey_add()
+        if use_usdc:
+            usdc_path = str(random.choice(usdc_files))
+            # Import USDC — remember existing objects to find the new ones
+            existing = set(bpy.data.objects.keys())
+            try:
+                bpy.ops.wm.usd_import(filepath=usdc_path)
+            except:
+                use_usdc = False
+            
+            if use_usdc:
+                new_objs = [o for o in bpy.data.objects if o.name not in existing and o.type == 'MESH']
+                if not new_objs:
+                    use_usdc = False
+                else:
+                    # Join all imported meshes into one object
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for o in new_objs:
+                        o.select_set(True)
+                    bpy.context.view_layer.objects.active = new_objs[0]
+                    if len(new_objs) > 1:
+                        bpy.ops.object.join()
+                    obj = bpy.context.active_object
+                    obj.name = f"DR_Distractor_{i}"
         
-        obj = bpy.context.active_object
-        obj.name = f"DR_Distractor_{i}"
+        if not use_usdc:
+            # Fallback to primitive
+            prim = random.choice(primitives)
+            if prim == 'cube':
+                bpy.ops.mesh.primitive_cube_add()
+            elif prim == 'sphere':
+                bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8)
+            elif prim == 'cylinder':
+                bpy.ops.mesh.primitive_cylinder_add(vertices=16)
+            elif prim == 'cone':
+                bpy.ops.mesh.primitive_cone_add(vertices=16)
+            elif prim == 'torus':
+                bpy.ops.mesh.primitive_torus_add()
+            obj = bpy.context.active_object
+            obj.name = f"DR_Distractor_{i}"
         
-        # Random position (in and around the workspace)
+        # Random position — keep within workspace bounds
         obj.location = (
-            rand_range(-1.5, 1.5),
-            rand_range(-1.0, 2.0),
-            rand_range(0.0, 2.0)
+            rand_range(-1.2, 1.2),
+            rand_range(-0.5, 2.0),
+            rand_range(0.0, 1.8)
         )
         
         # Random rotation
@@ -448,25 +486,35 @@ def add_flying_distractors(n_min, n_max, texture_files):
             rand_range(0, 2 * math.pi)
         )
         
-        # Random scale (small to medium)
-        s = rand_range(0.02, 0.25)
-        obj.scale = (s * rand_range(0.5, 2.0),
-                     s * rand_range(0.5, 2.0),
-                     s * rand_range(0.5, 2.0))
+        # Distance-based scale cap: objects closer to camera must be smaller
+        # so they don't block the entire view
+        dist_to_cam = (obj.location - cam_loc).length
+        # Max apparent size scales with distance: close (< 0.5m) = tiny, far (> 2m) = can be bigger
+        max_scale = min(0.15, dist_to_cam * 0.12)
+        max_scale = max(max_scale, 0.02)  # minimum size floor
         
-        # Smooth shading
+        s = rand_range(0.02, max_scale)
+        obj.scale = (s * rand_range(0.7, 1.3),
+                     s * rand_range(0.7, 1.3),
+                     s * rand_range(0.7, 1.3))
+        
+        # Smooth shading on distractors
         for poly in obj.data.polygons:
             poly.use_smooth = True
         
-        # Random material
-        if texture_files and random.random() > 0.5:
-            tex = random.choice(texture_files)
-            mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
-        else:
-            mat = create_random_material(f"distractor_{i}")
+        # Random material (keep original material 30% of the time for USDC objects)
+        apply_new_mat = True
+        if use_usdc and random.random() < 0.3 and obj.data.materials:
+            apply_new_mat = False
         
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+        if apply_new_mat:
+            if texture_files and random.random() < 0.6:
+                tex = random.choice(texture_files)
+                mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
+            else:
+                mat = create_random_material(f"distractor_{i}")
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
         
         obj.select_set(False)
 
