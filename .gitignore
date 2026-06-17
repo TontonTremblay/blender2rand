@@ -1,0 +1,13 @@
+# Assets (downloaded from HuggingFace, too large for git)
+assets/
+
+# Rendered output
+output/
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# Blender
+*.blend1
