@@ -116,9 +116,13 @@ def get_scene_bounds():
 # ============================================================
 
 def apply_mesh_smoothing():
-    """Apply smooth shading to meshes. No subdivision for now."""
-    # TODO: find a better smoothing solution for the robot mesh
-    pass
+    """Explicitly set FLAT shading on robot — keep the blocky sim look."""
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if 'robot' in obj.name:
+            for poly in obj.data.polygons:
+                poly.use_smooth = False
 
 
 # ============================================================
