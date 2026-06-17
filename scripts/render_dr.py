@@ -198,11 +198,17 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
         else:
             bsdf.inputs['Base Color'].default_value = rand_color()
     
-    # Randomize PBR properties
-    bsdf.inputs['Metallic'].default_value = rand_range(0.0, 1.0)
-    bsdf.inputs['Roughness'].default_value = rand_range(0.1, 1.0)
+    # Randomize PBR properties — but keep object VISIBLE
+    # Per DR reference tip 4: "Don't randomize away the cues the task actually depends on"
+    # The robot/objects must remain opaque and non-mirror to be seen by a vision policy.
+    bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
+    bsdf.inputs['Roughness'].default_value = rand_range(0.3, 1.0)  # avoid pure mirror
     if 'Specular IOR Level' in bsdf.inputs:
-        bsdf.inputs['Specular IOR Level'].default_value = rand_range(0.0, 1.0)
+        bsdf.inputs['Specular IOR Level'].default_value = rand_range(0.0, 0.8)
+    # Explicitly ensure opacity — no glass/transmission
+    bsdf.inputs['Alpha'].default_value = 1.0
+    if 'Transmission Weight' in bsdf.inputs:
+        bsdf.inputs['Transmission Weight'].default_value = 0.0
     
     return mat
 
@@ -219,6 +225,16 @@ def randomize_robot_material(texture_files):
     
     robot_objects = [obj for obj in bpy.data.objects if 'robot' in obj.name and obj.type == 'MESH']
     
+    # DR reference tip 4: "Don't randomize away the cues the task actually depends on"
+    # The robot MUST remain visible (opaque, non-mirror) for a vision-based policy.
+    # Constraint: roughness >= 0.3 (no pure mirrors), transmission = 0, alpha = 1.
+    
+    def _ensure_opaque(bsdf):
+        """Ensure material is fully opaque and non-transmissive."""
+        bsdf.inputs['Alpha'].default_value = 1.0
+        if 'Transmission Weight' in bsdf.inputs:
+            bsdf.inputs['Transmission Weight'].default_value = 0.0
+    
     if strategy == 'uniform_color':
         color = rand_color()
         mat = bpy.data.materials.new(name="robot_dr")
@@ -226,8 +242,9 @@ def randomize_robot_material(texture_files):
         bsdf = mat.node_tree.nodes.get('Principled BSDF')
         if bsdf:
             bsdf.inputs['Base Color'].default_value = color
-            bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.8)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.2, 0.9)
+            bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
+            bsdf.inputs['Roughness'].default_value = rand_range(0.3, 0.9)
+            _ensure_opaque(bsdf)
         for obj in robot_objects:
             obj.data.materials.clear()
             obj.data.materials.append(mat)
@@ -237,11 +254,12 @@ def randomize_robot_material(texture_files):
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get('Principled BSDF')
         if bsdf:
-            # Dark/grey metallic
-            val = rand_range(0.1, 0.5)
+            # Metallic but still diffuse enough to be visible
+            val = rand_range(0.15, 0.6)
             bsdf.inputs['Base Color'].default_value = (val, val, val, 1.0)
-            bsdf.inputs['Metallic'].default_value = rand_range(0.7, 1.0)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.1, 0.4)
+            bsdf.inputs['Metallic'].default_value = rand_range(0.5, 0.9)
+            bsdf.inputs['Roughness'].default_value = rand_range(0.3, 0.6)
+            _ensure_opaque(bsdf)
         for obj in robot_objects:
             obj.data.materials.clear()
             obj.data.materials.append(mat)
@@ -261,8 +279,9 @@ def randomize_robot_material(texture_files):
             bsdf = mat.node_tree.nodes.get('Principled BSDF')
             if bsdf:
                 bsdf.inputs['Base Color'].default_value = color
-                bsdf.inputs['Metallic'].default_value = rand_range(0.0, 1.0)
-                bsdf.inputs['Roughness'].default_value = rand_range(0.1, 1.0)
+                bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
+                bsdf.inputs['Roughness'].default_value = rand_range(0.3, 1.0)
+                _ensure_opaque(bsdf)
             obj.data.materials.clear()
             obj.data.materials.append(mat)
     
@@ -271,10 +290,11 @@ def randomize_robot_material(texture_files):
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get('Principled BSDF')
         if bsdf:
-            val = rand_range(0.02, 0.15)
+            val = rand_range(0.05, 0.2)
             bsdf.inputs['Base Color'].default_value = (val, val * rand_range(0.8, 1.2), val * rand_range(0.8, 1.2), 1.0)
-            bsdf.inputs['Metallic'].default_value = rand_range(0.3, 0.9)
-            bsdf.inputs['Roughness'].default_value = rand_range(0.3, 0.8)
+            bsdf.inputs['Metallic'].default_value = rand_range(0.3, 0.7)
+            bsdf.inputs['Roughness'].default_value = rand_range(0.4, 0.8)
+            _ensure_opaque(bsdf)
         for obj in robot_objects:
             obj.data.materials.clear()
             obj.data.materials.append(mat)
