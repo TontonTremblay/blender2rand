@@ -510,17 +510,21 @@ def add_flying_distractors(n_min, n_max, texture_files):
             rand_range(0, 2 * math.pi)
         )
         
-        # Distance-based scale cap: objects closer to camera must be smaller
-        # so they don't block the entire view
+        # Scale: USDC objects are already real-world size, primitives are 1m unit
         dist_to_cam = (obj.location - cam_loc).length
-        # Max apparent size scales with distance: close (< 0.5m) = tiny, far (> 2m) = can be bigger
         max_scale = min(0.15, dist_to_cam * 0.12)
-        max_scale = max(max_scale, 0.02)  # minimum size floor
+        max_scale = max(max_scale, 0.02)
         
-        s = rand_range(0.02, max_scale)
-        obj.scale = (s * rand_range(0.7, 1.3),
-                     s * rand_range(0.7, 1.3),
-                     s * rand_range(0.7, 1.3))
+        if use_usdc:
+            # USDC objects are real-world scale — keep around 1.0 with some variation
+            s = rand_range(0.7, 1.5)
+            obj.scale = (s, s, s)
+        else:
+            # Primitives are 1m — scale down to reasonable distractor size
+            s = rand_range(0.02, max_scale)
+            obj.scale = (s * rand_range(0.7, 1.3),
+                         s * rand_range(0.7, 1.3),
+                         s * rand_range(0.7, 1.3))
         
         # Smooth shading on distractors
         for poly in obj.data.polygons:
