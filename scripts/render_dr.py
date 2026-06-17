@@ -430,7 +430,7 @@ def add_flying_distractors(n_min, n_max, texture_files):
     
     for i in range(n):
         # 50% chance to use a real object from meta_assets_2k if available
-        use_usdc = usdc_files and random.random() < 0.5
+        use_usdc = usdc_files and random.random() < 0.7  # favor real objects
         
         if use_usdc:
             usdc_path = str(random.choice(usdc_files))
@@ -502,21 +502,57 @@ def add_flying_distractors(n_min, n_max, texture_files):
         for poly in obj.data.polygons:
             poly.use_smooth = True
         
-        # Random material (keep original material 30% of the time for USDC objects)
-        apply_new_mat = True
-        if use_usdc and random.random() < 0.3 and obj.data.materials:
-            apply_new_mat = False
-        
-        if apply_new_mat:
-            if texture_files and random.random() < 0.6:
-                tex = random.choice(texture_files)
-                mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
-            else:
-                mat = create_random_material(f"distractor_{i}")
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
+        # Always apply a new random material — imported USDC textures won't resolve
+        # and for DR we want visual variety anyway (geometry is what matters)
+        if texture_files and random.random() < 0.6:
+            tex = random.choice(texture_files)
+            mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
+        else:
+            mat = create_random_material(f"distractor_{i}")
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
         
         obj.select_set(False)
+
+
+# ============================================================
+# HDRI-ONLY BACKGROUND MODE
+# ============================================================
+
+def setup_hdri_only_background():
+    """Remove floor, backdrop, and extra lights — use HDRI as both lighting and background.
+    Keeps table and robot visible. Makes the world background visible in render."""
+    
+    # Hide floor and backdrop (don't delete — we may restore them)
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and ('floor' in obj.name or 'backdrop' in obj.name):
+            obj.hide_render = True
+            obj.hide_viewport = True
+    
+    # Remove any DR lights — HDRI provides all lighting
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith("DR_Light"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+    
+    # Make sure world background is visible in render (film transparent = False)
+    bpy.context.scene.render.film_transparent = False
+    
+    # Boost HDRI strength slightly since we removed other lights
+    world = bpy.context.scene.world
+    if world and world.use_nodes:
+        for node in world.node_tree.nodes:
+            if node.type == 'BACKGROUND':
+                node.inputs['Strength'].default_value = rand_range(0.8, 2.5)
+                break
+
+
+def restore_scene_geometry():
+    """Restore floor/backdrop visibility (undo HDRI-only mode)."""
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and ('floor' in obj.name or 'backdrop' in obj.name):
+            obj.hide_render = False
+            obj.hide_viewport = False
+    bpy.context.scene.render.film_transparent = False
 
 
 # ============================================================
@@ -586,14 +622,22 @@ def run_dr_variation(variation_idx, args, hdri_dir, texture_files):
     if hdri_dir:
         setup_hdri_lighting(hdri_dir)
     
-    # 3. Additional lights
-    print("  [3/7] Adding random lights...")
-    add_random_lights()
+    # 3. Scene structure: sometimes use HDRI-only background (no floor/backdrop)
+    #    This adds diversity — some scenes are "floating in environment"
+    use_hdri_background = random.random() < 0.35  # 35% of the time
+    print(f"  [3/7] Scene mode: {'HDRI-only background' if use_hdri_background else 'full scene'}...")
+    if use_hdri_background:
+        setup_hdri_only_background()
+    else:
+        # Restore floor/backdrop visibility if they were hidden
+        restore_scene_geometry()
+        add_random_lights()
     
     # 4. Material randomization
     print("  [4/7] Randomizing materials...")
     randomize_robot_material(texture_files)
-    randomize_table_material(texture_files)
+    if not use_hdri_background:
+        randomize_table_material(texture_files)
     randomize_object_material(texture_files)
     
     # 5. Camera randomization
