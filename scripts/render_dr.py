@@ -434,12 +434,16 @@ def add_flying_distractors(n_min, n_max, texture_files):
         
         if use_usdc:
             usdc_path = str(random.choice(usdc_files))
-            # Import USDC — remember existing objects to find the new ones
+            # Import USDC from its own directory so relative texture paths resolve
             existing = set(bpy.data.objects.keys())
+            orig_cwd = os.getcwd()
             try:
+                os.chdir(str(distractor_dir))
                 bpy.ops.wm.usd_import(filepath=usdc_path)
             except:
                 use_usdc = False
+            finally:
+                os.chdir(orig_cwd)
             
             if use_usdc:
                 new_objs = [o for o in bpy.data.objects if o.name not in existing and o.type == 'MESH']
@@ -502,15 +506,66 @@ def add_flying_distractors(n_min, n_max, texture_files):
         for poly in obj.data.polygons:
             poly.use_smooth = True
         
-        # Always apply a new random material — imported USDC textures won't resolve
-        # and for DR we want visual variety anyway (geometry is what matters)
-        if texture_files and random.random() < 0.6:
-            tex = random.choice(texture_files)
-            mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
+        # USDC objects keep their own materials/textures; primitives get random ones
+        if use_usdc:
+            pass  # keep original material from the USD file
         else:
-            mat = create_random_material(f"distractor_{i}")
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+            if texture_files and random.random() < 0.6:
+                tex = random.choice(texture_files)
+                mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
+            else:
+                mat = create_random_material(f"distractor_{i}")
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+        
+        # Animate distractor: move between two random positions over the timeline
+        scene = bpy.context.scene
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+        
+        start_loc = obj.location.copy()
+        end_loc = Vector((
+            start_loc.x + rand_range(-0.5, 0.5),
+            start_loc.y + rand_range(-0.5, 0.5),
+            start_loc.z + rand_range(-0.3, 0.3)
+        ))
+        
+        # Keyframe at start
+        obj.location = start_loc
+        obj.keyframe_insert(data_path="location", frame=frame_start)
+        # Keyframe at end
+        obj.location = end_loc
+        obj.keyframe_insert(data_path="location", frame=frame_end)
+        
+        # Also rotate over time
+        obj.rotation_euler = Euler((
+            rand_range(0, 2 * math.pi),
+            rand_range(0, 2 * math.pi),
+            rand_range(0, 2 * math.pi)
+        ))
+        obj.keyframe_insert(data_path="rotation_euler", frame=frame_start)
+        obj.rotation_euler = Euler((
+            rand_range(0, 2 * math.pi),
+            rand_range(0, 2 * math.pi),
+            rand_range(0, 2 * math.pi)
+        ))
+        obj.keyframe_insert(data_path="rotation_euler", frame=frame_end)
+        
+        # Set linear interpolation for smooth motion
+        if obj.animation_data and obj.animation_data.action:
+            action = obj.animation_data.action
+            if action.is_action_layered:
+                for layer in action.layers:
+                    for strip in layer.strips:
+                        if hasattr(strip, 'channelbags'):
+                            for cb in strip.channelbags:
+                                for fc in cb.fcurves:
+                                    for kp in fc.keyframe_points:
+                                        kp.interpolation = 'LINEAR'
+            else:
+                for fc in action.fcurves:
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'LINEAR'
         
         obj.select_set(False)
 
