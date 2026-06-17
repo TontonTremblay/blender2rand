@@ -116,40 +116,9 @@ def get_scene_bounds():
 # ============================================================
 
 def apply_mesh_smoothing():
-    """Apply smooth shading and subdivision to robot meshes to reduce blockiness."""
-    for obj in bpy.data.objects:
-        if obj.type != 'MESH':
-            continue
-        
-        # Apply smooth shading to all meshes
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        
-        # Set smooth shading
-        for poly in obj.data.polygons:
-            poly.use_smooth = True
-        
-        # Add auto-smooth via modifier for robot parts (Blender 5.x approach)
-        if 'robot' in obj.name:
-            # Add subdivision surface for smoother appearance
-            if 'Subdivision' not in [m.name for m in obj.modifiers]:
-                subsurf = obj.modifiers.new(name='Subdivision', type='SUBSURF')
-                subsurf.levels = 1  # viewport
-                subsurf.render_levels = 2  # render
-                subsurf.use_limit_surface = True
-            
-            # Add smooth by angle modifier (Blender 5.x way to do auto-smooth)
-            if 'Smooth by Angle' not in [m.name for m in obj.modifiers]:
-                try:
-                    # In Blender 4.1+/5.x, use the geometry nodes based smooth
-                    smooth_mod = obj.modifiers.new(name='Smooth by Angle', type='NODES')
-                    # Use built-in smooth by angle node group if available
-                    # Fallback: just use weighted normals
-                except:
-                    pass
-        
-        # For table/floor, just smooth shading is enough
-        obj.select_set(False)
+    """Apply smooth shading to meshes. No subdivision for now."""
+    # TODO: find a better smoothing solution for the robot mesh
+    pass
 
 
 # ============================================================
