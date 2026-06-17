@@ -417,8 +417,19 @@ def add_flying_distractors(n_min, n_max, texture_files):
     n = random.randint(n_min, n_max)
     
     # Find USDC distractor files
-    script_dir = Path(__file__).parent
-    project_dir = script_dir.parent
+    # Resolve project dir robustly (works both when run directly and when exec'd)
+    _this_file = Path(__file__) if '__file__' in dir() and not str(__file__).startswith('<') else None
+    if _this_file and _this_file.exists():
+        project_dir = _this_file.parent.parent
+    else:
+        # Fallback: search common locations
+        for candidate in [Path("/Users/jtremblay/code/blender2dr"), Path.cwd(), Path.cwd().parent]:
+            if (candidate / "assets" / "distractors").exists():
+                project_dir = candidate
+                break
+        else:
+            project_dir = Path("/Users/jtremblay/code/blender2dr")
+    
     distractor_dir = project_dir / "assets" / "distractors"
     usdc_files = list(distractor_dir.glob("*.usdc")) if distractor_dir.exists() else []
     
