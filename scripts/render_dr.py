@@ -1,32 +1,34 @@
 """
 Domain Randomization Renderer for Sim2Real Jaco Robot Picking.
 
-This script opens a .blend file containing animated robot motion,
-applies aggressive visual domain randomization following best practices from:
-- MolmoBot (2026): diversity > photorealism, randomize camera
-- Tremblay et al. (2018): flying distractors
-- RoboTwin 2.0 (2025): background textures, lighting, clutter
-- OpenAI ADR (2019): aggressive randomization ranges
+Single unified script for all DR rendering modes:
+- grid: Render a NxN grid of single-frame DR variations (random frames)
+- animation: Render full animation sequences with DR
+- single: Render a single DR frame
 
 Randomization axes:
 1. HDRI environment lighting (from env_map_hdri dataset)
-2. Robot material randomization (color, metallic, roughness)
-3. Table/floor/backdrop texture randomization
-4. Camera pose perturbation (position + look-at jitter)
-5. Flying distractors (random geometric shapes with random materials)
+2. Robot material randomization per-link (textures + colors)
+3. Table/floor/backdrop texture randomization + table scale
+4. Camera pose perturbation (position, rotation, focal length)
+5. Flying distractors (primitives + USDC objects from meta_assets_2k)
 6. Additional area/point lights with random color/intensity
 7. Object material randomization
-8. Flat shading on robot (no smoothing — preserves sim geometry)
-9. Post-processing (color management jitter)
+8. HDRI-only background mode (35% — no floor/backdrop)
+9. Post-processing (exposure, color management)
 
 Usage:
-    blender --background <file.blend> --python render_dr.py -- \
-        --output_dir /path/to/output \
-        --seed 0 \
-        --n_variations 10 \
-        [--hdri_dir /path/to/hdris] \
-        [--texture_dir /path/to/textures] \
-        [--resolution 512]
+    # 3x3 grid of random frames
+    blender --background <file.blend> --python render_dr.py -- \\
+        --mode grid --grid_size 3 --output_dir output/grid
+
+    # Full animation with DR
+    blender --background <file.blend> --python render_dr.py -- \\
+        --mode animation --n_variations 10 --output_dir output/anim
+
+    # Single frame
+    blender --background <file.blend> --python render_dr.py -- \\
+        --mode single --frame 30 --output_dir output/single
 """
 
 import bpy
@@ -46,7 +48,6 @@ import numpy as np
 # ============================================================
 
 def parse_args():
-    # Get args after '--'
     argv = sys.argv
     if "--" in argv:
         argv = argv[argv.index("--") + 1:]
@@ -54,24 +55,28 @@ def parse_args():
         argv = []
     
     parser = argparse.ArgumentParser(description="Domain Randomization Renderer")
+    parser.add_argument("--mode", type=str, default="grid",
+                        choices=["grid", "animation", "single"],
+                        help="Render mode: grid (NxN), animation (full seq), single (one frame)")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n_variations", type=int, default=10,
-                        help="Number of DR variations to render per blend file")
+                        help="Number of DR variations (animation mode)")
+    parser.add_argument("--grid_size", type=int, default=3,
+                        help="Grid dimension NxN (grid mode)")
+    parser.add_argument("--frame", type=int, default=-1,
+                        help="Frame to render (-1 = random)")
     parser.add_argument("--hdri_dir", type=str, default=None)
     parser.add_argument("--texture_dir", type=str, default=None)
-    parser.add_argument("--resolution", type=int, default=512)
-    parser.add_argument("--samples", type=int, default=64,
-                        help="Render samples (Cycles)")
+    parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument("--samples", type=int, default=8,
+                        help="Render samples")
     parser.add_argument("--engine", type=str, default="CYCLES",
                         choices=["CYCLES", "BLENDER_EEVEE"])
-    parser.add_argument("--render_video", action="store_true", default=False,
-                        help="Render as video (mp4) instead of image sequence")
     parser.add_argument("--frame_step", type=int, default=1,
-                        help="Render every N frames")
+                        help="Render every N frames (animation mode)")
     parser.add_argument("--n_distractors_min", type=int, default=5)
     parser.add_argument("--n_distractors_max", type=int, default=15)
-    parser.add_argument("--use_gpu", action="store_true", default=True)
     
     return parser.parse_args(argv)
 
@@ -86,7 +91,6 @@ def set_seed(seed):
 
 
 def rand_color():
-    """Random RGB color."""
     return (random.random(), random.random(), random.random(), 1.0)
 
 
@@ -94,21 +98,15 @@ def rand_range(lo, hi):
     return random.uniform(lo, hi)
 
 
-def get_scene_bounds():
-    """Get approximate bounding box of the scene for distractor placement."""
-    all_coords = []
-    for obj in bpy.data.objects:
-        if obj.type == 'MESH' and 'robot' in obj.name:
-            # Use object location as proxy
-            all_coords.append(obj.location.copy())
-    if not all_coords:
-        return Vector((-1, -1, 0)), Vector((1, 1, 1.5))
-    
-    xs = [c.x for c in all_coords]
-    ys = [c.y for c in all_coords]
-    zs = [c.z for c in all_coords]
-    return (Vector((min(xs) - 0.5, min(ys) - 0.5, 0)),
-            Vector((max(xs) + 0.5, max(ys) + 0.5, max(zs) + 0.5)))
+def get_project_dir():
+    """Resolve project directory robustly."""
+    _this_file = Path(__file__) if '__file__' in dir() and not str(__file__).startswith('<') else None
+    if _this_file and _this_file.exists():
+        return _this_file.parent.parent
+    for candidate in [Path("/Users/jtremblay/code/blender2dr"), Path.cwd(), Path.cwd().parent]:
+        if (candidate / "assets" / "distractors").exists():
+            return candidate
+    return Path("/Users/jtremblay/code/blender2dr")
 
 
 # ============================================================
@@ -118,9 +116,7 @@ def get_scene_bounds():
 def apply_mesh_smoothing():
     """Explicitly set FLAT shading on robot — keep the blocky sim look."""
     for obj in bpy.data.objects:
-        if obj.type != 'MESH':
-            continue
-        if 'robot' in obj.name:
+        if obj.type == 'MESH' and 'robot' in obj.name:
             for poly in obj.data.polygons:
                 poly.use_smooth = False
 
@@ -135,25 +131,19 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
-    
-    # Clear existing nodes
     nodes.clear()
     
-    # Create principled BSDF
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.location = (0, 0)
-    
     output = nodes.new('ShaderNodeOutputMaterial')
     output.location = (300, 0)
     links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
     
     if texture_path and os.path.exists(texture_path):
-        # Use texture image
         tex_node = nodes.new('ShaderNodeTexImage')
         tex_node.location = (-400, 0)
         tex_node.image = bpy.data.images.load(texture_path)
         
-        # Add texture coordinate and mapping for random UV transform
         tex_coord = nodes.new('ShaderNodeTexCoord')
         tex_coord.location = (-800, 0)
         mapping = nodes.new('ShaderNodeMapping')
@@ -165,20 +155,16 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
         links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
         links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
     else:
-        # Random solid color
         if base_color:
             bsdf.inputs['Base Color'].default_value = base_color
         else:
             bsdf.inputs['Base Color'].default_value = rand_color()
     
-    # Randomize PBR properties — but keep object VISIBLE
-    # Per DR reference tip 4: "Don't randomize away the cues the task actually depends on"
-    # The robot/objects must remain opaque and non-mirror to be seen by a vision policy.
+    # Keep visible: no mirrors, no glass (DR reference tip 4)
     bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.7)
-    bsdf.inputs['Roughness'].default_value = rand_range(0.3, 1.0)  # avoid pure mirror
+    bsdf.inputs['Roughness'].default_value = rand_range(0.3, 1.0)
     if 'Specular IOR Level' in bsdf.inputs:
         bsdf.inputs['Specular IOR Level'].default_value = rand_range(0.0, 0.8)
-    # Explicitly ensure opacity — no glass/transmission
     bsdf.inputs['Alpha'].default_value = 1.0
     if 'Transmission Weight' in bsdf.inputs:
         bsdf.inputs['Transmission Weight'].default_value = 0.0
@@ -187,14 +173,9 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
 
 
 def randomize_robot_material(texture_files):
-    """Randomize robot material PER LINK — each robot part gets its own random material.
-    Heavily favors textures for aggressive DR (per MolmoBot: diversity > photorealism)."""
-    
+    """Randomize robot material PER LINK — 70% textured, 30% solid color."""
     robot_objects = [obj for obj in bpy.data.objects if 'robot' in obj.name and obj.type == 'MESH']
-    
     for obj in robot_objects:
-        # Each link gets an independent random material
-        # 70% chance texture, 30% chance solid color
         if texture_files and random.random() < 0.7:
             tex = random.choice(texture_files)
             mat = create_random_material(f"robot_{obj.name}", texture_path=str(tex))
@@ -204,58 +185,48 @@ def randomize_robot_material(texture_files):
         obj.data.materials.append(mat)
 
 
+def randomize_table_geometry():
+    """Randomly scale the table in X and Y."""
+    table_obj = bpy.data.objects.get('shape_35_table')
+    sx = rand_range(0.7, 1.8)
+    sy = rand_range(0.7, 1.8)
+    if table_obj:
+        table_obj.scale.x = sx
+        table_obj.scale.y = sy
+    for obj in bpy.data.objects:
+        if 'leg' in obj.name and obj.type == 'MESH':
+            obj.scale.x = sx
+            obj.scale.y = sy
+
+
 def randomize_table_material(texture_files):
-    """Randomize table, floor, and backdrop — heavily favor textures."""
-    table_objects = [obj for obj in bpy.data.objects 
-                     if obj.type == 'MESH' and ('table' in obj.name or 'leg' in obj.name)]
-    floor_objects = [obj for obj in bpy.data.objects 
-                     if obj.type == 'MESH' and 'floor' in obj.name]
-    backdrop_objects = [obj for obj in bpy.data.objects 
-                        if obj.type == 'MESH' and 'backdrop' in obj.name]
-    
-    # Table — 80% textured
-    if texture_files and random.random() < 0.8:
-        tex = random.choice(texture_files)
-        mat = create_random_material("table_dr", texture_path=str(tex))
-    else:
-        mat = create_random_material("table_dr")
-    for obj in table_objects:
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
-    
-    # Floor — 80% textured
-    if texture_files and random.random() < 0.8:
-        tex = random.choice(texture_files)
-        mat = create_random_material("floor_dr", texture_path=str(tex))
-    else:
-        mat = create_random_material("floor_dr")
-    for obj in floor_objects:
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
-    
-    # Backdrop — 80% textured
-    if texture_files and random.random() < 0.8:
-        tex = random.choice(texture_files)
-        mat = create_random_material("backdrop_dr", texture_path=str(tex))
-    else:
-        mat = create_random_material("backdrop_dr")
-    for obj in backdrop_objects:
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+    """Randomize table, floor, and backdrop — 80% textured."""
+    for group_name, group_filter in [
+        ("table", lambda o: 'table' in o.name or 'leg' in o.name),
+        ("floor", lambda o: 'floor' in o.name),
+        ("backdrop", lambda o: 'backdrop' in o.name),
+    ]:
+        objs = [o for o in bpy.data.objects if o.type == 'MESH' and group_filter(o)]
+        if texture_files and random.random() < 0.8:
+            tex = random.choice(texture_files)
+            mat = create_random_material(f"{group_name}_dr", texture_path=str(tex))
+        else:
+            mat = create_random_material(f"{group_name}_dr")
+        for obj in objs:
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
 
 
 def randomize_object_material(texture_files):
-    """Randomize the hope_object (target object) material — 80% textured."""
+    """Randomize the hope_object material — 80% textured."""
     obj = bpy.data.objects.get('hope_object')
     if not obj:
         return
-    
     if texture_files and random.random() < 0.8:
         tex = random.choice(texture_files)
         mat = create_random_material("object_dr", texture_path=str(tex))
     else:
         mat = create_random_material("object_dr")
-    
     obj.data.materials.clear()
     obj.data.materials.append(mat)
 
@@ -268,11 +239,9 @@ def setup_hdri_lighting(hdri_dir):
     """Set up HDRI environment lighting with random rotation and intensity."""
     hdri_files = list(Path(hdri_dir).glob("*.hdr")) + list(Path(hdri_dir).glob("*.exr"))
     if not hdri_files:
-        print(f"WARNING: No HDRI files found in {hdri_dir}")
         return False
     
     hdri_path = str(random.choice(hdri_files))
-    
     world = bpy.context.scene.world
     if not world:
         world = bpy.data.worlds.new("World")
@@ -283,84 +252,53 @@ def setup_hdri_lighting(hdri_dir):
     links = world.node_tree.links
     nodes.clear()
     
-    # Environment texture
     env_tex = nodes.new('ShaderNodeTexEnvironment')
     env_tex.location = (-600, 0)
     env_tex.image = bpy.data.images.load(hdri_path)
     
-    # Mapping for random rotation
     mapping = nodes.new('ShaderNodeMapping')
     mapping.location = (-800, 0)
     mapping.inputs['Rotation'].default_value = (
-        rand_range(-0.1, 0.1),
-        rand_range(-0.1, 0.1),
-        rand_range(0, 2 * math.pi)  # Full Z rotation
-    )
+        rand_range(-0.1, 0.1), rand_range(-0.1, 0.1), rand_range(0, 2 * math.pi))
     
     tex_coord = nodes.new('ShaderNodeTexCoord')
     tex_coord.location = (-1000, 0)
     
-    # Background node with random strength
     background = nodes.new('ShaderNodeBackground')
     background.location = (-200, 0)
     background.inputs['Strength'].default_value = rand_range(0.3, 3.0)
     
-    # Output
     output = nodes.new('ShaderNodeOutputWorld')
     output.location = (0, 0)
     
-    # Link
     links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
     links.new(mapping.outputs['Vector'], env_tex.inputs['Vector'])
     links.new(env_tex.outputs['Color'], background.inputs['Color'])
     links.new(background.outputs['Background'], output.inputs['Surface'])
-    
     return True
 
 
 def add_random_lights():
-    """Add random additional lights to the scene."""
-    # Remove any existing DR lights
+    """Add random additional lights."""
     for obj in list(bpy.data.objects):
         if obj.name.startswith("DR_Light"):
             bpy.data.objects.remove(obj, do_unlink=True)
     
-    n_lights = random.randint(1, 4)
-    
-    for i in range(n_lights):
+    for i in range(random.randint(1, 4)):
         light_type = random.choice(['POINT', 'AREA', 'SPOT'])
-        
         light_data = bpy.data.lights.new(name=f"DR_Light_{i}", type=light_type)
         light_obj = bpy.data.objects.new(name=f"DR_Light_{i}", object_data=light_data)
         bpy.context.collection.objects.link(light_obj)
         
-        # Random position around the scene
-        light_obj.location = (
-            rand_range(-2.0, 2.0),
-            rand_range(-2.0, 2.0),
-            rand_range(0.5, 3.0)
-        )
-        
-        # Random color temperature (warm to cool)
-        r = rand_range(0.7, 1.0)
-        g = rand_range(0.7, 1.0)
-        b = rand_range(0.7, 1.0)
-        light_data.color = (r, g, b)
-        
-        # Random energy
+        light_obj.location = (rand_range(-2, 2), rand_range(-2, 2), rand_range(0.5, 3))
+        light_data.color = (rand_range(0.7, 1), rand_range(0.7, 1), rand_range(0.7, 1))
         light_data.energy = rand_range(10, 500)
         
         if light_type == 'AREA':
             light_data.size = rand_range(0.5, 3.0)
         elif light_type == 'SPOT':
             light_data.spot_size = rand_range(0.3, 1.5)
-            light_data.spot_blend = rand_range(0.0, 1.0)
-            # Point roughly toward scene center
-            light_obj.rotation_euler = Euler((
-                rand_range(0.5, 1.5),
-                rand_range(-0.5, 0.5),
-                rand_range(0, 2 * math.pi)
-            ))
+            light_obj.rotation_euler = Euler((rand_range(0.5, 1.5), rand_range(-0.5, 0.5), rand_range(0, 2*math.pi)))
 
 
 # ============================================================
@@ -368,29 +306,21 @@ def add_random_lights():
 # ============================================================
 
 def randomize_camera():
-    """Randomize camera pose - critical for sim2real transfer (MolmoBot)."""
+    """Randomize camera pose — critical for sim2real (MolmoBot)."""
     cam = bpy.data.objects.get('Camera')
     if not cam:
         return
-    
-    # Get original camera location as center of randomization
     orig_loc = cam.location.copy()
+    orig_rot = cam.rotation_euler.copy()
     
-    # Perturb position (moderate - we still want to see the robot)
     cam.location.x = orig_loc.x + rand_range(-0.3, 0.3)
     cam.location.y = orig_loc.y + rand_range(-0.3, 0.3)
     cam.location.z = orig_loc.z + rand_range(-0.2, 0.2)
-    
-    # Perturb rotation slightly
-    orig_rot = cam.rotation_euler.copy()
     cam.rotation_euler.x = orig_rot.x + rand_range(-0.08, 0.08)
     cam.rotation_euler.y = orig_rot.y + rand_range(-0.08, 0.08)
     cam.rotation_euler.z = orig_rot.z + rand_range(-0.08, 0.08)
-    
-    # Randomize focal length
     cam.data.lens = rand_range(25, 60)
     
-    # Slight DOF blur sometimes
     if random.random() > 0.7:
         cam.data.dof.use_dof = True
         cam.data.dof.aperture_fstop = rand_range(1.4, 8.0)
@@ -400,53 +330,33 @@ def randomize_camera():
 
 
 # ============================================================
-# FLYING DISTRACTORS (Tremblay et al. 2018)
+# FLYING DISTRACTORS
 # ============================================================
 
 def add_flying_distractors(n_min, n_max, texture_files):
-    """Add flying distractors: mix of primitives and real objects from meta_assets_2k.
+    """Add flying distractors: mix of primitives + USDC objects from meta_assets_2k.
+    USDC objects keep their original materials. All distractors are animated."""
     
-    Objects are scaled so they never dominate the frame — size is capped
-    relative to distance from camera (closer = smaller).
-    """
     # Remove existing distractors
     for obj in list(bpy.data.objects):
         if obj.name.startswith("DR_Distractor"):
             bpy.data.objects.remove(obj, do_unlink=True)
     
     n = random.randint(n_min, n_max)
-    
-    # Find USDC distractor files
-    # Resolve project dir robustly (works both when run directly and when exec'd)
-    _this_file = Path(__file__) if '__file__' in dir() and not str(__file__).startswith('<') else None
-    if _this_file and _this_file.exists():
-        project_dir = _this_file.parent.parent
-    else:
-        # Fallback: search common locations
-        for candidate in [Path("/Users/jtremblay/code/blender2dr"), Path.cwd(), Path.cwd().parent]:
-            if (candidate / "assets" / "distractors").exists():
-                project_dir = candidate
-                break
-        else:
-            project_dir = Path("/Users/jtremblay/code/blender2dr")
-    
+    project_dir = get_project_dir()
     distractor_dir = project_dir / "assets" / "distractors"
     usdc_files = list(distractor_dir.glob("*.usdc")) if distractor_dir.exists() else []
     
-    # Get camera location for distance-based scaling
     cam = bpy.data.objects.get('Camera')
     cam_loc = cam.location.copy() if cam else Vector((0, 1.5, 1.35))
     
     primitives = ['cube', 'sphere', 'cylinder', 'cone', 'torus']
     
     for i in range(n):
-        # 50% chance to use a real object from meta_assets_2k if available
-        use_usdc = usdc_files and random.random() < 0.7  # favor real objects
+        use_usdc = usdc_files and random.random() < 0.7
         
         if use_usdc:
             usdc_path = str(random.choice(usdc_files))
-            # Import USDC from its own directory so relative texture paths resolve
-            # Save frame range — USD import resets it
             scene = bpy.context.scene
             orig_frame_start = scene.frame_start
             orig_frame_end = scene.frame_end
@@ -460,7 +370,6 @@ def add_flying_distractors(n_min, n_max, texture_files):
                 use_usdc = False
             finally:
                 os.chdir(orig_cwd)
-                # Restore frame range
                 scene.frame_start = orig_frame_start
                 scene.frame_end = orig_frame_end
                 scene.render.fps = orig_fps
@@ -470,7 +379,6 @@ def add_flying_distractors(n_min, n_max, texture_files):
                 if not new_objs:
                     use_usdc = False
                 else:
-                    # Join all imported meshes into one object
                     bpy.ops.object.select_all(action='DESELECT')
                     for o in new_objs:
                         o.select_set(True)
@@ -481,7 +389,6 @@ def add_flying_distractors(n_min, n_max, texture_files):
                     obj.name = f"DR_Distractor_{i}"
         
         if not use_usdc:
-            # Fallback to primitive
             prim = random.choice(primitives)
             if prim == 'cube':
                 bpy.ops.mesh.primitive_cube_add()
@@ -496,44 +403,28 @@ def add_flying_distractors(n_min, n_max, texture_files):
             obj = bpy.context.active_object
             obj.name = f"DR_Distractor_{i}"
         
-        # Random position — keep within workspace bounds
-        obj.location = (
-            rand_range(-1.2, 1.2),
-            rand_range(-0.5, 2.0),
-            rand_range(0.0, 1.8)
-        )
+        # Random position
+        obj.location = (rand_range(-1.2, 1.2), rand_range(-0.5, 2.0), rand_range(0.0, 1.8))
         
         # Random rotation
-        obj.rotation_euler = (
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi)
-        )
+        obj.rotation_euler = (rand_range(0, 2*math.pi), rand_range(0, 2*math.pi), rand_range(0, 2*math.pi))
         
-        # Scale: USDC objects are already real-world size, primitives are 1m unit
-        dist_to_cam = (obj.location - cam_loc).length
-        max_scale = min(0.15, dist_to_cam * 0.12)
-        max_scale = max(max_scale, 0.02)
-        
+        # Scale: USDC ~1.0 (real size), primitives small
         if use_usdc:
-            # USDC objects are real-world scale — keep around 1.0 with some variation
             s = rand_range(0.7, 1.5)
             obj.scale = (s, s, s)
         else:
-            # Primitives are 1m — scale down to reasonable distractor size
+            dist_to_cam = (obj.location - cam_loc).length
+            max_scale = max(0.02, min(0.15, dist_to_cam * 0.12))
             s = rand_range(0.02, max_scale)
-            obj.scale = (s * rand_range(0.7, 1.3),
-                         s * rand_range(0.7, 1.3),
-                         s * rand_range(0.7, 1.3))
+            obj.scale = (s * rand_range(0.7, 1.3), s * rand_range(0.7, 1.3), s * rand_range(0.7, 1.3))
         
         # Smooth shading on distractors
         for poly in obj.data.polygons:
             poly.use_smooth = True
         
-        # USDC objects keep their own materials/textures; primitives get random ones
-        if use_usdc:
-            pass  # keep original material from the USD file
-        else:
+        # Materials: USDC keeps original, primitives get random
+        if not use_usdc:
             if texture_files and random.random() < 0.6:
                 tex = random.choice(texture_files)
                 mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
@@ -542,7 +433,7 @@ def add_flying_distractors(n_min, n_max, texture_files):
             obj.data.materials.clear()
             obj.data.materials.append(mat)
         
-        # Animate distractor: move between two random positions over the timeline
+        # Animate: move between two positions over timeline
         scene = bpy.context.scene
         frame_start = scene.frame_start
         frame_end = scene.frame_end
@@ -551,31 +442,19 @@ def add_flying_distractors(n_min, n_max, texture_files):
         end_loc = Vector((
             start_loc.x + rand_range(-0.5, 0.5),
             start_loc.y + rand_range(-0.5, 0.5),
-            start_loc.z + rand_range(-0.3, 0.3)
-        ))
+            start_loc.z + rand_range(-0.3, 0.3)))
         
-        # Keyframe at start
         obj.location = start_loc
         obj.keyframe_insert(data_path="location", frame=frame_start)
-        # Keyframe at end
         obj.location = end_loc
         obj.keyframe_insert(data_path="location", frame=frame_end)
         
-        # Also rotate over time
-        obj.rotation_euler = Euler((
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi)
-        ))
+        obj.rotation_euler = Euler((rand_range(0, 2*math.pi), rand_range(0, 2*math.pi), rand_range(0, 2*math.pi)))
         obj.keyframe_insert(data_path="rotation_euler", frame=frame_start)
-        obj.rotation_euler = Euler((
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi),
-            rand_range(0, 2 * math.pi)
-        ))
+        obj.rotation_euler = Euler((rand_range(0, 2*math.pi), rand_range(0, 2*math.pi), rand_range(0, 2*math.pi)))
         obj.keyframe_insert(data_path="rotation_euler", frame=frame_end)
         
-        # Set linear interpolation for smooth motion
+        # Linear interpolation
         if obj.animation_data and obj.animation_data.action:
             action = obj.animation_data.action
             if action.is_action_layered:
@@ -599,24 +478,15 @@ def add_flying_distractors(n_min, n_max, texture_files):
 # ============================================================
 
 def setup_hdri_only_background():
-    """Remove floor, backdrop, and extra lights — use HDRI as both lighting and background.
-    Keeps table and robot visible. Makes the world background visible in render."""
-    
-    # Hide floor and backdrop (don't delete — we may restore them)
+    """Hide floor/backdrop, use HDRI as background. Remove extra lights."""
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and ('floor' in obj.name or 'backdrop' in obj.name):
             obj.hide_render = True
             obj.hide_viewport = True
-    
-    # Remove any DR lights — HDRI provides all lighting
     for obj in list(bpy.data.objects):
         if obj.name.startswith("DR_Light"):
             bpy.data.objects.remove(obj, do_unlink=True)
-    
-    # Make sure world background is visible in render (film transparent = False)
     bpy.context.scene.render.film_transparent = False
-    
-    # Boost HDRI strength slightly since we removed other lights
     world = bpy.context.scene.world
     if world and world.use_nodes:
         for node in world.node_tree.nodes:
@@ -626,7 +496,7 @@ def setup_hdri_only_background():
 
 
 def restore_scene_geometry():
-    """Restore floor/backdrop visibility (undo HDRI-only mode)."""
+    """Restore floor/backdrop visibility."""
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and ('floor' in obj.name or 'backdrop' in obj.name):
             obj.hide_render = False
@@ -635,136 +505,200 @@ def restore_scene_geometry():
 
 
 # ============================================================
-# RENDER SETTINGS
+# CORE: APPLY DR TO SCENE
 # ============================================================
 
-def setup_render(args):
-    """Configure render settings."""
-    scene = bpy.context.scene
+def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_max=15):
+    """Apply one full round of domain randomization to the current scene.
+    Returns whether HDRI-only background was used."""
     
-    # Engine
-    scene.render.engine = args.engine
-    
-    if args.engine == 'CYCLES':
-        scene.cycles.samples = args.samples
-        scene.cycles.use_denoising = True
-        
-        # GPU if available
-        if args.use_gpu:
-            prefs = bpy.context.preferences.addons.get('cycles')
-            if prefs:
-                prefs.preferences.compute_device_type = 'METAL'  # macOS
-                bpy.context.preferences.addons['cycles'].preferences.get_devices()
-                scene.cycles.device = 'GPU'
-    
-    elif args.engine == 'BLENDER_EEVEE':
-        scene.eevee.taa_render_samples = args.samples
-    
-    # Resolution
-    scene.render.resolution_x = args.resolution
-    scene.render.resolution_y = args.resolution
-    scene.render.resolution_percentage = 100
-    
-    # Color management randomization (subtle)
-    scene.view_settings.exposure = rand_range(-0.5, 0.5)
-    # Randomly choose view transform
-    try:
-        if random.random() > 0.5:
-            scene.view_settings.view_transform = 'Filmic'
-        else:
-            scene.view_settings.view_transform = 'Standard'
-    except:
-        pass  # Some Blender versions have different options
-
-
-# ============================================================
-# MAIN PIPELINE
-# ============================================================
-
-def run_dr_variation(variation_idx, args, hdri_dir, texture_files):
-    """Apply one variation of domain randomization and render."""
-    
-    seed = args.seed * 1000 + variation_idx
     set_seed(seed)
+    apply_mesh_smoothing()
     
-    print(f"\n{'='*60}")
-    print(f"  DR Variation {variation_idx} (seed={seed})")
-    print(f"{'='*60}")
-    
-    # 1. Mesh smoothing (only once, on first variation)
-    if variation_idx == 0:
-        print("  [1/7] Applying mesh smoothing...")
-        apply_mesh_smoothing()
-    
-    # 2. HDRI environment
-    print("  [2/7] Randomizing HDRI lighting...")
+    # HDRI lighting
     if hdri_dir:
         setup_hdri_lighting(hdri_dir)
     
-    # 3. Scene structure: sometimes use HDRI-only background (no floor/backdrop)
-    #    This adds diversity — some scenes are "floating in environment"
-    use_hdri_background = random.random() < 0.35  # 35% of the time
-    print(f"  [3/7] Scene mode: {'HDRI-only background' if use_hdri_background else 'full scene'}...")
-    if use_hdri_background:
+    # 35% chance HDRI-only background
+    use_hdri_bg = random.random() < 0.35
+    if use_hdri_bg:
         setup_hdri_only_background()
     else:
-        # Restore floor/backdrop visibility if they were hidden
         restore_scene_geometry()
         add_random_lights()
-    
-    # 4. Material randomization
-    print("  [4/7] Randomizing materials...")
-    randomize_robot_material(texture_files)
-    if not use_hdri_background:
         randomize_table_material(texture_files)
+        randomize_table_geometry()
+    
+    # Materials
+    randomize_robot_material(texture_files)
     randomize_object_material(texture_files)
     
-    # 5. Camera randomization
-    print("  [5/7] Randomizing camera...")
+    # Camera
     randomize_camera()
     
-    # 6. Flying distractors
-    print("  [6/7] Adding flying distractors...")
-    add_flying_distractors(args.n_distractors_min, args.n_distractors_max, texture_files)
+    # Distractors
+    add_flying_distractors(n_distractors_min, n_distractors_max, texture_files)
     
-    # 7. Render settings
-    print("  [7/7] Setting up render...")
-    setup_render(args)
-    
-    # Set output path
-    scene = bpy.context.scene
-    var_dir = os.path.join(args.output_dir, f"variation_{variation_idx:04d}")
-    os.makedirs(var_dir, exist_ok=True)
-    
-    if args.render_video:
-        scene.render.filepath = os.path.join(var_dir, "render.mp4")
-        scene.render.image_settings.file_format = 'FFMPEG'
-        scene.render.ffmpeg.format = 'MPEG4'
-        scene.render.ffmpeg.codec = 'H264'
-        scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'
-    else:
-        scene.render.filepath = os.path.join(var_dir, "frame_")
-        scene.render.image_settings.file_format = 'PNG'
-        scene.render.image_settings.color_mode = 'RGB'
-    
-    scene.frame_step = args.frame_step
-    
-    # Render animation
-    print(f"  Rendering to: {var_dir}")
-    bpy.ops.render.render(animation=True)
-    print(f"  ✓ Variation {variation_idx} complete!")
-    
-    return var_dir
+    return use_hdri_bg
 
+
+# ============================================================
+# RENDER SETUP
+# ============================================================
+
+def setup_render_settings(engine, samples, resolution):
+    """Configure render engine and resolution."""
+    scene = bpy.context.scene
+    scene.render.engine = engine
+    
+    if engine == 'CYCLES':
+        scene.cycles.samples = samples
+        scene.cycles.use_denoising = True
+        scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        scene.cycles.device = 'GPU'
+        prefs = bpy.context.preferences.addons.get('cycles')
+        if prefs:
+            try:
+                prefs.preferences.compute_device_type = 'METAL'
+                prefs.preferences.get_devices()
+                for d in prefs.preferences.devices:
+                    d.use = True
+            except:
+                pass
+    elif engine == 'BLENDER_EEVEE':
+        scene.eevee.taa_render_samples = samples
+    
+    scene.render.resolution_x = resolution
+    scene.render.resolution_y = resolution
+    scene.render.resolution_percentage = 100
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.image_settings.color_mode = 'RGB'
+    
+    # Color management randomization
+    scene.view_settings.exposure = rand_range(-0.3, 0.3)
+    try:
+        scene.view_settings.view_transform = random.choice(['Filmic', 'Standard'])
+    except:
+        pass
+
+
+def render_frame(output_path, frame):
+    """Render a single frame to file."""
+    scene = bpy.context.scene
+    scene.frame_set(frame)
+    scene.render.filepath = output_path
+    bpy.ops.render.render(write_still=True)
+
+
+# ============================================================
+# MODE: GRID
+# ============================================================
+
+def run_grid(args, hdri_dir, texture_files):
+    """Render NxN grid of DR variations at random frames."""
+    n_total = args.grid_size * args.grid_size
+    
+    cam = bpy.data.objects.get('Camera')
+    orig_cam_loc = cam.location.copy() if cam else None
+    orig_cam_rot = cam.rotation_euler.copy() if cam else None
+    orig_cam_lens = cam.data.lens if cam else None
+    
+    print(f"Rendering {n_total} DR variations ({args.grid_size}x{args.grid_size} grid)...")
+    
+    for i in range(n_total):
+        seed = args.seed * 10000 + i
+        
+        # Reset camera before each variation
+        if cam and orig_cam_loc:
+            cam.location = orig_cam_loc.copy()
+            cam.rotation_euler = orig_cam_rot.copy()
+            cam.data.lens = orig_cam_lens
+            cam.data.dof.use_dof = False
+        
+        # Apply DR
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+        setup_render_settings(args.engine, args.samples, args.resolution)
+        
+        # Pick random frame
+        frame_start = bpy.context.scene.frame_start
+        frame_end = bpy.context.scene.frame_end
+        if args.frame >= 0:
+            render_f = args.frame
+        else:
+            render_f = random.randint(frame_start, frame_end)
+        
+        # Render
+        out_path = os.path.join(args.output_dir, f"cell_{i:03d}.png")
+        render_frame(out_path, render_f)
+        print(f"  [{i+1}/{n_total}] cell_{i:03d}.png (seed={seed}, frame={render_f})")
+    
+    print(f"All {n_total} cells rendered.")
+
+
+# ============================================================
+# MODE: ANIMATION
+# ============================================================
+
+def run_animation(args, hdri_dir, texture_files):
+    """Render full animation sequences with DR."""
+    cam = bpy.data.objects.get('Camera')
+    orig_cam_loc = cam.location.copy() if cam else None
+    orig_cam_rot = cam.rotation_euler.copy() if cam else None
+    orig_cam_lens = cam.data.lens if cam else None
+    
+    for var_idx in range(args.n_variations):
+        seed = args.seed * 1000 + var_idx
+        
+        if cam and orig_cam_loc:
+            cam.location = orig_cam_loc.copy()
+            cam.rotation_euler = orig_cam_rot.copy()
+            cam.data.lens = orig_cam_lens
+            cam.data.dof.use_dof = False
+        
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+        setup_render_settings(args.engine, args.samples, args.resolution)
+        
+        var_dir = os.path.join(args.output_dir, f"variation_{var_idx:04d}")
+        os.makedirs(var_dir, exist_ok=True)
+        
+        scene = bpy.context.scene
+        scene.render.filepath = os.path.join(var_dir, "frame_")
+        scene.frame_step = args.frame_step
+        
+        print(f"  Variation {var_idx} (seed={seed}) -> {var_dir}")
+        bpy.ops.render.render(animation=True)
+        print(f"  ✓ Done")
+
+
+# ============================================================
+# MODE: SINGLE
+# ============================================================
+
+def run_single(args, hdri_dir, texture_files):
+    """Render a single DR frame."""
+    seed = args.seed
+    apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+    setup_render_settings(args.engine, args.samples, args.resolution)
+    
+    frame_start = bpy.context.scene.frame_start
+    frame_end = bpy.context.scene.frame_end
+    render_f = args.frame if args.frame >= 0 else random.randint(frame_start, frame_end)
+    
+    out_path = os.path.join(args.output_dir, "render.png")
+    render_frame(out_path, render_f)
+    print(f"Rendered frame {render_f} -> {out_path}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     args = parse_args()
     
     # Resolve asset directories
-    script_dir = Path(__file__).parent
-    project_dir = script_dir.parent
+    project_dir = get_project_dir()
     assets_dir = project_dir / "assets"
-    
     hdri_dir = args.hdri_dir or str(assets_dir / "hdri")
     texture_dir = args.texture_dir or str(assets_dir / "surface_textures")
     
@@ -775,38 +709,23 @@ def main():
             texture_files.extend(Path(texture_dir).rglob(ext))
     print(f"Found {len(texture_files)} texture files")
     
-    # Check HDRI dir
     if not os.path.isdir(hdri_dir):
         print(f"WARNING: HDRI directory not found: {hdri_dir}")
         hdri_dir = None
     else:
-        n_hdri = len(list(Path(hdri_dir).glob("*.hdr")))
-        print(f"Found {n_hdri} HDRI files")
+        print(f"Found {len(list(Path(hdri_dir).glob('*.hdr')))} HDRI files")
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Store original scene state for resetting between variations
-    # (Camera position, materials are modified in-place so we save originals)
-    cam = bpy.data.objects.get('Camera')
-    orig_cam_loc = cam.location.copy() if cam else None
-    orig_cam_rot = cam.rotation_euler.copy() if cam else None
-    orig_cam_lens = cam.data.lens if cam else None
+    # Dispatch by mode
+    if args.mode == 'grid':
+        run_grid(args, hdri_dir, texture_files)
+    elif args.mode == 'animation':
+        run_animation(args, hdri_dir, texture_files)
+    elif args.mode == 'single':
+        run_single(args, hdri_dir, texture_files)
     
-    # Run DR variations
-    for var_idx in range(args.n_variations):
-        # Reset camera to original before each variation
-        if cam and orig_cam_loc:
-            cam.location = orig_cam_loc.copy()
-            cam.rotation_euler = orig_cam_rot.copy()
-            cam.data.lens = orig_cam_lens
-            cam.data.dof.use_dof = False
-        
-        run_dr_variation(var_idx, args, hdri_dir, texture_files)
-    
-    print(f"\n{'='*60}")
-    print(f"  ALL DONE: {args.n_variations} variations rendered")
-    print(f"  Output: {args.output_dir}")
-    print(f"{'='*60}")
+    print("DONE")
 
 
 if __name__ == "__main__":
