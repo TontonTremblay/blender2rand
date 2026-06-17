@@ -107,7 +107,7 @@ def main():
     project_dir = script_dir.parent
     assets_dir = project_dir / "assets"
     hdri_dir = str(assets_dir / "hdri")
-    texture_dir = str(assets_dir / "textures")
+    texture_dir = str(assets_dir / "surface_textures")
     
     # Collect texture files
     texture_files = []

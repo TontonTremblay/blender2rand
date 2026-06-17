@@ -16,7 +16,7 @@ Randomization axes:
 5. Flying distractors (random geometric shapes with random materials)
 6. Additional area/point lights with random color/intensity
 7. Object material randomization
-8. Mesh smoothing (auto-smooth + subdivision on robot)
+8. Flat shading on robot (no smoothing — preserves sim geometry)
 9. Post-processing (color management jitter)
 
 Usage:
@@ -595,7 +595,7 @@ def main():
     assets_dir = project_dir / "assets"
     
     hdri_dir = args.hdri_dir or str(assets_dir / "hdri")
-    texture_dir = args.texture_dir or str(assets_dir / "textures")
+    texture_dir = args.texture_dir or str(assets_dir / "surface_textures")
     
     # Collect texture files
     texture_files = []
