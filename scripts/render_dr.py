@@ -342,11 +342,11 @@ def randomize_camera(handheld=False):
 
 
 def add_handheld_motion(cam):
-    """Add handheld camera shake — keyframes subtle noise on position and rotation.
+    """Add handheld camera shake using FCurve noise modifiers.
     
-    Simulates a person holding the camera with natural micro-movements:
-    - Low-frequency drift (breathing, body sway)
-    - Higher-frequency jitter (hand tremor)
+    Uses Blender's built-in noise modifier on FCurves for truly smooth,
+    continuous camera motion that simulates handheld shake without
+    keyframe discontinuities.
     """
     scene = bpy.context.scene
     frame_start = scene.frame_start
@@ -360,69 +360,61 @@ def add_handheld_motion(cam):
     base_loc = cam.location.copy()
     base_rot = cam.rotation_euler.copy()
     
-    # Amplitude controls — subtle enough to look natural
-    loc_amplitude = rand_range(0.005, 0.025)  # meters of drift
-    rot_amplitude = rand_range(0.002, 0.01)   # radians of wobble
+    # Amplitude controls
+    loc_amplitude = rand_range(0.08, 0.18)   # meters of drift (8-18cm)
+    rot_amplitude = rand_range(0.03, 0.06)   # radians of wobble (~1.7-3.4 degrees)
     
-    # Number of keyframes (every ~3-5 frames for organic feel)
-    key_interval = random.randint(3, 6)
+    # Noise frequency — lower = slower, more organic drift
+    # Scale controls how "fast" the noise oscillates (in frames)
+    noise_scale = rand_range(10.0, 25.0)  # period of oscillation in frames
     
-    frames = list(range(frame_start, frame_end + 1, key_interval))
-    if frames[-1] != frame_end:
-        frames.append(frame_end)
+    # Insert two keyframes at start/end with base values (required for FCurves to exist)
+    cam.location = base_loc
+    cam.keyframe_insert(data_path="location", frame=frame_start)
+    cam.keyframe_insert(data_path="location", frame=frame_end)
     
-    # Generate smooth noise using cumulative random walk
-    # This gives organic low-frequency drift rather than pure random jitter
-    loc_noise = [[0.0, 0.0, 0.0]]
-    rot_noise = [[0.0, 0.0, 0.0]]
+    cam.rotation_euler = base_rot
+    cam.keyframe_insert(data_path="rotation_euler", frame=frame_start)
+    cam.keyframe_insert(data_path="rotation_euler", frame=frame_end)
     
-    for _ in range(len(frames) - 1):
-        loc_step = [random.gauss(0, loc_amplitude * 0.5) for _ in range(3)]
-        rot_step = [random.gauss(0, rot_amplitude * 0.5) for _ in range(3)]
-        
-        # Accumulate but mean-revert (spring back toward center)
-        revert = 0.3
-        new_loc = [loc_noise[-1][j] * (1 - revert) + loc_step[j] for j in range(3)]
-        new_rot = [rot_noise[-1][j] * (1 - revert) + rot_step[j] for j in range(3)]
-        
-        # Clamp to amplitude
-        new_loc = [max(-loc_amplitude, min(loc_amplitude, v)) for v in new_loc]
-        new_rot = [max(-rot_amplitude, min(rot_amplitude, v)) for v in new_rot]
-        
-        loc_noise.append(new_loc)
-        rot_noise.append(new_rot)
+    # Access FCurves and add noise modifiers
+    action = cam.animation_data.action
     
-    # Apply keyframes
-    for idx, frame in enumerate(frames):
-        cam.location = Vector((
-            base_loc.x + loc_noise[idx][0],
-            base_loc.y + loc_noise[idx][1],
-            base_loc.z + loc_noise[idx][2]
-        ))
-        cam.keyframe_insert(data_path="location", frame=frame)
-        
-        cam.rotation_euler = Euler((
-            base_rot.x + rot_noise[idx][0],
-            base_rot.y + rot_noise[idx][1],
-            base_rot.z + rot_noise[idx][2]
-        ))
-        cam.keyframe_insert(data_path="rotation_euler", frame=frame)
-    
-    # Set bezier interpolation for smooth motion (not linear — handheld is smooth)
-    if cam.animation_data and cam.animation_data.action:
-        action = cam.animation_data.action
+    def get_fcurves(action):
+        """Get fcurves from action, handling layered and legacy actions."""
         if action.is_action_layered:
+            fcurves = []
             for layer in action.layers:
                 for strip in layer.strips:
                     if hasattr(strip, 'channelbags'):
                         for cb in strip.channelbags:
-                            for fc in cb.fcurves:
-                                for kp in fc.keyframe_points:
-                                    kp.interpolation = 'BEZIER'
+                            fcurves.extend(cb.fcurves)
+            return fcurves
         else:
-            for fc in action.fcurves:
-                for kp in fc.keyframe_points:
-                    kp.interpolation = 'BEZIER'
+            return list(action.fcurves)
+    
+    fcurves = get_fcurves(action)
+    
+    for fc in fcurves:
+        # Determine amplitude based on channel
+        if 'location' in fc.data_path:
+            amplitude = loc_amplitude
+        elif 'rotation' in fc.data_path:
+            amplitude = rot_amplitude
+        else:
+            continue
+        
+        # Add noise modifier
+        mod = fc.modifiers.new(type='NOISE')
+        mod.strength = amplitude
+        mod.scale = noise_scale
+        mod.phase = random.uniform(0, 1000)  # random offset so each axis is different
+        mod.depth = 2  # octaves of noise detail for richer motion
+        mod.use_restricted_range = False
+        
+        # Set keyframes to flat (value = 0 offset from base) so noise is the only motion
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
 
 
 # ============================================================
@@ -712,7 +704,7 @@ def run_grid(args, hdri_dir, texture_files):
             cam.data.dof.use_dof = False
         
         # Apply DR
-        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
         setup_render_settings(args.engine, args.samples, args.resolution)
         
         # Pick random frame
@@ -751,7 +743,7 @@ def run_animation(args, hdri_dir, texture_files):
             cam.data.lens = orig_cam_lens
             cam.data.dof.use_dof = False
         
-        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
         setup_render_settings(args.engine, args.samples, args.resolution)
         
         var_dir = os.path.join(args.output_dir, f"variation_{var_idx:04d}")
@@ -773,7 +765,7 @@ def run_animation(args, hdri_dir, texture_files):
 def run_single(args, hdri_dir, texture_files):
     """Render a single DR frame."""
     seed = args.seed
-    apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max)
+    apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
     setup_render_settings(args.engine, args.samples, args.resolution)
     
     frame_start = bpy.context.scene.frame_start
