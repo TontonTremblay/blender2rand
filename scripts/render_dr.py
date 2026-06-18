@@ -153,7 +153,8 @@ def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=N
         mapping.inputs['Scale'].default_value = (rand_range(0.5, 5.0),) * 3
         mapping.inputs['Rotation'].default_value = (0, 0, rand_range(0, 2 * math.pi))
         
-        links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
+        # Use 'Generated' coordinates — works even without UVs
+        links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
         links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
         links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
     else:
