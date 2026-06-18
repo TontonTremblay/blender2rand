@@ -77,6 +77,8 @@ def parse_args():
                         help="Render every N frames (animation mode)")
     parser.add_argument("--n_distractors_min", type=int, default=5)
     parser.add_argument("--n_distractors_max", type=int, default=15)
+    parser.add_argument("--handheld", action="store_true", default=False,
+                        help="Add handheld camera shake/motion over the animation")
     
     return parser.parse_args(argv)
 
@@ -305,14 +307,19 @@ def add_random_lights():
 # CAMERA RANDOMIZATION
 # ============================================================
 
-def randomize_camera():
-    """Randomize camera pose — critical for sim2real (MolmoBot)."""
+def randomize_camera(handheld=False):
+    """Randomize camera pose — critical for sim2real (MolmoBot).
+    
+    Args:
+        handheld: If True, add keyframed jitter simulating handheld camera motion.
+    """
     cam = bpy.data.objects.get('Camera')
     if not cam:
         return
     orig_loc = cam.location.copy()
     orig_rot = cam.rotation_euler.copy()
     
+    # Static offset
     cam.location.x = orig_loc.x + rand_range(-0.3, 0.3)
     cam.location.y = orig_loc.y + rand_range(-0.3, 0.3)
     cam.location.z = orig_loc.z + rand_range(-0.2, 0.2)
@@ -327,6 +334,94 @@ def randomize_camera():
         cam.data.dof.focus_distance = rand_range(1.0, 3.0)
     else:
         cam.data.dof.use_dof = False
+    
+    # Handheld motion: keyframe subtle position/rotation jitter over timeline
+    if handheld:
+        add_handheld_motion(cam)
+
+
+def add_handheld_motion(cam):
+    """Add handheld camera shake — keyframes subtle noise on position and rotation.
+    
+    Simulates a person holding the camera with natural micro-movements:
+    - Low-frequency drift (breathing, body sway)
+    - Higher-frequency jitter (hand tremor)
+    """
+    scene = bpy.context.scene
+    frame_start = scene.frame_start
+    frame_end = scene.frame_end
+    
+    # Remove existing camera animation (from previous DR rounds)
+    if cam.animation_data and cam.animation_data.action:
+        bpy.data.actions.remove(cam.animation_data.action)
+        cam.animation_data_clear()
+    
+    base_loc = cam.location.copy()
+    base_rot = cam.rotation_euler.copy()
+    
+    # Amplitude controls — subtle enough to look natural
+    loc_amplitude = rand_range(0.005, 0.025)  # meters of drift
+    rot_amplitude = rand_range(0.002, 0.01)   # radians of wobble
+    
+    # Number of keyframes (every ~3-5 frames for organic feel)
+    key_interval = random.randint(3, 6)
+    
+    frames = list(range(frame_start, frame_end + 1, key_interval))
+    if frames[-1] != frame_end:
+        frames.append(frame_end)
+    
+    # Generate smooth noise using cumulative random walk
+    # This gives organic low-frequency drift rather than pure random jitter
+    loc_noise = [[0.0, 0.0, 0.0]]
+    rot_noise = [[0.0, 0.0, 0.0]]
+    
+    for _ in range(len(frames) - 1):
+        loc_step = [random.gauss(0, loc_amplitude * 0.5) for _ in range(3)]
+        rot_step = [random.gauss(0, rot_amplitude * 0.5) for _ in range(3)]
+        
+        # Accumulate but mean-revert (spring back toward center)
+        revert = 0.3
+        new_loc = [loc_noise[-1][j] * (1 - revert) + loc_step[j] for j in range(3)]
+        new_rot = [rot_noise[-1][j] * (1 - revert) + rot_step[j] for j in range(3)]
+        
+        # Clamp to amplitude
+        new_loc = [max(-loc_amplitude, min(loc_amplitude, v)) for v in new_loc]
+        new_rot = [max(-rot_amplitude, min(rot_amplitude, v)) for v in new_rot]
+        
+        loc_noise.append(new_loc)
+        rot_noise.append(new_rot)
+    
+    # Apply keyframes
+    for idx, frame in enumerate(frames):
+        cam.location = Vector((
+            base_loc.x + loc_noise[idx][0],
+            base_loc.y + loc_noise[idx][1],
+            base_loc.z + loc_noise[idx][2]
+        ))
+        cam.keyframe_insert(data_path="location", frame=frame)
+        
+        cam.rotation_euler = Euler((
+            base_rot.x + rot_noise[idx][0],
+            base_rot.y + rot_noise[idx][1],
+            base_rot.z + rot_noise[idx][2]
+        ))
+        cam.keyframe_insert(data_path="rotation_euler", frame=frame)
+    
+    # Set bezier interpolation for smooth motion (not linear — handheld is smooth)
+    if cam.animation_data and cam.animation_data.action:
+        action = cam.animation_data.action
+        if action.is_action_layered:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if hasattr(strip, 'channelbags'):
+                        for cb in strip.channelbags:
+                            for fc in cb.fcurves:
+                                for kp in fc.keyframe_points:
+                                    kp.interpolation = 'BEZIER'
+        else:
+            for fc in action.fcurves:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'BEZIER'
 
 
 # ============================================================
@@ -508,7 +603,7 @@ def restore_scene_geometry():
 # CORE: APPLY DR TO SCENE
 # ============================================================
 
-def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_max=15):
+def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_max=15, handheld=False):
     """Apply one full round of domain randomization to the current scene.
     Returns whether HDRI-only background was used."""
     
@@ -534,7 +629,7 @@ def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_m
     randomize_object_material(texture_files)
     
     # Camera
-    randomize_camera()
+    randomize_camera(handheld=handheld)
     
     # Distractors
     add_flying_distractors(n_distractors_min, n_distractors_max, texture_files)
