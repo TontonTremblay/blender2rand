@@ -79,6 +79,8 @@ def parse_args():
     parser.add_argument("--n_distractors_max", type=int, default=15)
     parser.add_argument("--handheld", action="store_true", default=False,
                         help="Add handheld camera shake/motion over the animation")
+    parser.add_argument("--post_dr", action="store_true", default=False,
+                        help="Apply compositor-based post-processing DR (motion blur, lens distortion, etc.)")
     parser.add_argument("--save_blend", type=str, default=None,
                         help="Save the .blend file after applying DR (for inspection)")
     
@@ -598,10 +600,161 @@ def restore_scene_geometry():
 
 
 # ============================================================
+# POST-PROCESSING DR (Compositor-based)
+# ============================================================
+
+def apply_post_processing_dr():
+    """Apply compositor-based post-processing DR effects.
+    
+    These effects use full 3D scene knowledge (depth, motion vectors) and operate
+    in HDR linear space — impossible to replicate correctly as 2D augmentation.
+    
+    Effects (each randomly enabled/parameterized):
+    1. Motion blur — physically correct per-object blur from 3D motion vectors
+    2. Lens distortion — barrel/pincushion + chromatic aberration
+    3. Vignetting — radial intensity falloff from lens optics
+    4. Glare/bloom — light bleeding from bright specular highlights
+    5. Brightness/contrast — exposure-like variation
+    6. Color temperature / white balance shift
+    """
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    
+    # Blender 5.1+: use compositing_node_group instead of scene.node_tree
+    tree = scene.compositing_node_group
+    if tree is None:
+        tree = bpy.data.node_groups.new('Compositing Nodetree', 'CompositorNodeTree')
+        scene.compositing_node_group = tree
+    
+    nodes = tree.nodes
+    links = tree.links
+    
+    # Clear existing compositor nodes and interface
+    nodes.clear()
+    for item in list(tree.interface.items_tree):
+        tree.interface.remove(item)
+    
+    # Create group output socket (replaces CompositorNodeComposite in Blender 5.1)
+    tree.interface.new_socket(name='Image', in_out='OUTPUT', socket_type='NodeSocketColor')
+    
+    # Create render layers input and group output
+    render_layers = nodes.new('CompositorNodeRLayers')
+    render_layers.location = (-800, 0)
+    
+    group_output = nodes.new('NodeGroupOutput')
+    group_output.location = (800, 0)
+    
+    # Track the current output socket to chain effects
+    current_output = render_layers.outputs['Image']
+    
+    # --- 1. MOTION BLUR (70% chance) ---
+    if random.random() < 0.7:
+        scene.render.use_motion_blur = True
+        scene.render.motion_blur_shutter = rand_range(0.1, 0.8)
+    else:
+        scene.render.use_motion_blur = False
+    
+    # --- 2. LENS DISTORTION + CHROMATIC ABERRATION (60% chance) ---
+    if random.random() < 0.6:
+        lens_dist = nodes.new('CompositorNodeLensdist')
+        lens_dist.location = (-400, 0)
+        lens_dist.inputs['Distortion'].default_value = rand_range(-0.04, 0.06)
+        lens_dist.inputs['Dispersion'].default_value = rand_range(0.0, 0.04)
+        lens_dist.inputs['Fit'].default_value = True
+        
+        links.new(current_output, lens_dist.inputs['Image'])
+        current_output = lens_dist.outputs['Image']
+    
+    # --- 3. VIGNETTING (50% chance) ---
+    if random.random() < 0.5:
+        # Create vignette using ellipse mask + blur + AlphaOver to darken edges
+        ellipse = nodes.new('CompositorNodeEllipseMask')
+        ellipse.location = (-400, -300)
+        ellipse.width = rand_range(0.75, 0.95)
+        ellipse.height = rand_range(0.75, 0.95)
+        
+        # Blur the mask for soft falloff
+        blur_mask = nodes.new('CompositorNodeBlur')
+        blur_mask.location = (-200, -300)
+        blur_size = random.randint(200, 400)
+        blur_mask.inputs['Size'].default_value = (blur_size, blur_size)
+        links.new(ellipse.outputs['Mask'], blur_mask.inputs['Image'])
+        
+        # Use SetAlpha to apply vignette as alpha, then AlphaOver with black
+        set_alpha = nodes.new('CompositorNodeSetAlpha')
+        set_alpha.location = (-100, 0)
+        links.new(current_output, set_alpha.inputs['Image'])
+        links.new(blur_mask.outputs['Image'], set_alpha.inputs['Alpha'])
+        
+        # AlphaOver: black background + vignetted image on top
+        alpha_over = nodes.new('CompositorNodeAlphaOver')
+        alpha_over.location = (0, 0)
+        # Background = darkened version (factor controls vignette strength)
+        alpha_over.inputs['Factor'].default_value = rand_range(0.5, 0.9)
+        links.new(current_output, alpha_over.inputs['Background'])
+        links.new(set_alpha.outputs['Image'], alpha_over.inputs['Foreground'])
+        current_output = alpha_over.outputs['Image']
+    
+    # --- 4. GLARE / BLOOM (40% chance) ---
+    if random.random() < 0.4:
+        glare = nodes.new('CompositorNodeGlare')
+        glare.location = (100, 200)
+        # Set type via input menu
+        glare_type = random.choice(['Bloom', 'Fog Glow'])
+        glare.inputs['Type'].default_value = glare_type
+        glare.inputs['Threshold'].default_value = rand_range(0.5, 2.0)
+        glare.inputs['Quality'].default_value = 'Medium'
+        glare.inputs['Size'].default_value = rand_range(0.4, 0.9)
+        
+        links.new(current_output, glare.inputs['Image'])
+        current_output = glare.outputs['Image']
+    
+    # --- 5. BRIGHTNESS / CONTRAST (50% chance) ---
+    if random.random() < 0.5:
+        bright_contrast = nodes.new('CompositorNodeBrightContrast')
+        bright_contrast.location = (300, 0)
+        bright_contrast.inputs['Bright'].default_value = rand_range(-0.08, 0.08)
+        bright_contrast.inputs['Contrast'].default_value = rand_range(-0.15, 0.2)
+        
+        links.new(current_output, bright_contrast.inputs['Image'])
+        current_output = bright_contrast.outputs['Image']
+    
+    # --- 6. COLOR TEMPERATURE / WHITE BALANCE SHIFT (40% chance) ---
+    if random.random() < 0.4:
+        color_balance = nodes.new('CompositorNodeColorBalance')
+        color_balance.location = (500, 0)
+        # Use Lift/Gamma/Gain mode (set via Type input)
+        color_balance.inputs['Type'].default_value = 'Lift/Gamma/Gain'
+        
+        # Find the RGBA Lift and Gain inputs (there are scalar and RGBA versions)
+        for inp in color_balance.inputs:
+            if inp.name == 'Lift' and inp.type == 'RGBA':
+                inp.default_value = (
+                    1.0 + rand_range(-0.06, 0.06),
+                    1.0 + rand_range(-0.06, 0.06),
+                    1.0 + rand_range(-0.06, 0.06),
+                    1.0
+                )
+            elif inp.name == 'Gain' and inp.type == 'RGBA':
+                inp.default_value = (
+                    1.0 + rand_range(-0.12, 0.12),
+                    1.0 + rand_range(-0.12, 0.12),
+                    1.0 + rand_range(-0.12, 0.12),
+                    1.0
+                )
+        
+        links.new(current_output, color_balance.inputs['Image'])
+        current_output = color_balance.outputs['Image']
+    
+    # Connect final output to group output
+    links.new(current_output, group_output.inputs['Image'])
+
+
+# ============================================================
 # CORE: APPLY DR TO SCENE
 # ============================================================
 
-def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_max=15, handheld=False):
+def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_max=15, handheld=False, post_dr=False):
     """Apply one full round of domain randomization to the current scene.
     Returns whether HDRI-only background was used."""
     
@@ -631,6 +784,10 @@ def apply_dr(seed, hdri_dir, texture_files, n_distractors_min=5, n_distractors_m
     
     # Distractors
     add_flying_distractors(n_distractors_min, n_distractors_max, texture_files)
+    
+    # Post-processing compositor effects
+    if post_dr:
+        apply_post_processing_dr()
     
     return use_hdri_bg
 
@@ -709,7 +866,7 @@ def run_grid(args, hdri_dir, texture_files):
             cam.data.dof.use_dof = False
         
         # Apply DR
-        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld, post_dr=args.post_dr)
         setup_render_settings(args.engine, args.samples, args.resolution)
         
         # Pick random frame
@@ -748,7 +905,7 @@ def run_animation(args, hdri_dir, texture_files):
             cam.data.lens = orig_cam_lens
             cam.data.dof.use_dof = False
         
-        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
+        apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld, post_dr=args.post_dr)
         setup_render_settings(args.engine, args.samples, args.resolution)
         
         var_dir = os.path.join(args.output_dir, f"variation_{var_idx:04d}")
@@ -770,7 +927,7 @@ def run_animation(args, hdri_dir, texture_files):
 def run_single(args, hdri_dir, texture_files):
     """Render a single DR frame."""
     seed = args.seed
-    apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld)
+    apply_dr(seed, hdri_dir, texture_files, args.n_distractors_min, args.n_distractors_max, handheld=args.handheld, post_dr=args.post_dr)
     setup_render_settings(args.engine, args.samples, args.resolution)
     
     frame_start = bpy.context.scene.frame_start
