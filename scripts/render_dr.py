@@ -79,6 +79,8 @@ def parse_args():
     parser.add_argument("--n_distractors_max", type=int, default=15)
     parser.add_argument("--handheld", action="store_true", default=False,
                         help="Add handheld camera shake/motion over the animation")
+    parser.add_argument("--save_blend", type=str, default=None,
+                        help="Save the .blend file after applying DR (for inspection)")
     
     return parser.parse_args(argv)
 
@@ -362,11 +364,12 @@ def add_handheld_motion(cam):
     
     # Amplitude controls
     loc_amplitude = rand_range(0.08, 0.18)   # meters of drift (8-18cm)
-    rot_amplitude = rand_range(0.03, 0.06)   # radians of wobble (~1.7-3.4 degrees)
+    rot_amplitude = rand_range(0.06, 0.12)   # radians of wobble (~3.4-7 degrees)
     
     # Noise frequency — lower = slower, more organic drift
     # Scale controls how "fast" the noise oscillates (in frames)
-    noise_scale = rand_range(10.0, 25.0)  # period of oscillation in frames
+    noise_scale_loc = rand_range(10.0, 25.0)  # translation oscillation period
+    noise_scale_rot = rand_range(8.0, 18.0)   # rotation oscillation (slightly faster)
     
     # Insert two keyframes at start/end with base values (required for FCurves to exist)
     cam.location = base_loc
@@ -396,18 +399,20 @@ def add_handheld_motion(cam):
     fcurves = get_fcurves(action)
     
     for fc in fcurves:
-        # Determine amplitude based on channel
+        # Determine amplitude and scale based on channel
         if 'location' in fc.data_path:
             amplitude = loc_amplitude
+            scale = noise_scale_loc
         elif 'rotation' in fc.data_path:
             amplitude = rot_amplitude
+            scale = noise_scale_rot
         else:
             continue
         
         # Add noise modifier
         mod = fc.modifiers.new(type='NOISE')
         mod.strength = amplitude
-        mod.scale = noise_scale
+        mod.scale = scale
         mod.phase = random.uniform(0, 1000)  # random offset so each axis is different
         mod.depth = 2  # octaves of noise detail for richer motion
         mod.use_restricted_range = False
@@ -812,6 +817,13 @@ def main():
         run_animation(args, hdri_dir, texture_files)
     elif args.mode == 'single':
         run_single(args, hdri_dir, texture_files)
+    
+    # Optionally save .blend for inspection
+    if args.save_blend:
+        blend_path = args.save_blend
+        os.makedirs(os.path.dirname(blend_path), exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+        print(f"Saved blend: {blend_path}")
     
     print("DONE")
 

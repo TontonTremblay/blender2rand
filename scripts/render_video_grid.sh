@@ -9,10 +9,11 @@ set -e
 PROJECT_DIR="/Users/jtremblay/code/blender2dr"
 BLEND_DIR="/Users/jtremblay/Downloads/sim2real_jaco_examples"
 OUTPUT_DIR="${PROJECT_DIR}/output/video_grid"
-GRID_SIZE=9
-RESOLUTION=128  # per cell (9x9 = 1152x1152 final)
-FRAME_STEP=3
-SAMPLES=8
+GRID_SIZE=3
+RESOLUTION=256  # per cell (9x9 = 2304x2304 final)
+FRAME_STEP=2
+SAMPLES=64
+ENGINE=BLENDER_EEVEE
 
 rm -rf "${OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}"
@@ -44,7 +45,7 @@ for i in $(seq 0 $((N_TOTAL - 1))); do
         --seed ${SEED} \
         --n_variations 1 \
         --resolution ${RESOLUTION} \
-        --engine CYCLES \
+        --engine ${ENGINE} \
         --samples ${SAMPLES} \
         --frame_step ${FRAME_STEP} \
         --handheld \
