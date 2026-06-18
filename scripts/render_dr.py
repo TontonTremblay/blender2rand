@@ -133,8 +133,160 @@ def apply_mesh_smoothing():
 # MATERIAL RANDOMIZATION
 # ============================================================
 
-def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=None):
-    """Create a new material with randomized PBR properties."""
+def create_animated_procedural_material(name_prefix="dr_animated"):
+    """Create a material with animated procedural texture using the W (4th) dimension.
+    
+    Animates the W input of Noise/Voronoi/Wave textures over the timeline,
+    creating organic flowing/morphing patterns. Great for DR because it adds
+    temporal texture variation that makes policies robust to dynamic backgrounds.
+    """
+    mat = bpy.data.materials.new(name=f"{name_prefix}_{random.randint(0, 99999)}")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (300, 0)
+    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    
+    # Texture coordinates
+    tex_coord = nodes.new('ShaderNodeTexCoord')
+    tex_coord.location = (-800, 0)
+    mapping = nodes.new('ShaderNodeMapping')
+    mapping.location = (-600, 0)
+    scale = rand_range(1.0, 8.0)
+    mapping.inputs['Scale'].default_value = (scale, scale, scale)
+    links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
+    
+    # Choose procedural texture type
+    tex_type = random.choice(['NOISE', 'VORONOI', 'WAVE', 'MUSGRAVE'])
+    
+    if tex_type == 'NOISE':
+        tex = nodes.new('ShaderNodeTexNoise')
+        tex.location = (-400, 0)
+        tex.inputs['Scale'].default_value = rand_range(2.0, 15.0)
+        tex.inputs['Detail'].default_value = rand_range(2.0, 8.0)
+        tex.inputs['Roughness'].default_value = rand_range(0.3, 0.9)
+        tex.inputs['Distortion'].default_value = rand_range(0.0, 3.0)
+        tex.noise_dimensions = '4D'
+        w_input = tex.inputs['W']
+        links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+        color_output = tex.outputs['Color']
+        
+    elif tex_type == 'VORONOI':
+        tex = nodes.new('ShaderNodeTexVoronoi')
+        tex.location = (-400, 0)
+        tex.inputs['Scale'].default_value = rand_range(2.0, 12.0)
+        tex.inputs['Randomness'].default_value = rand_range(0.5, 1.0)
+        tex.voronoi_dimensions = '4D'
+        tex.feature = random.choice(['F1', 'F2', 'SMOOTH_F1'])
+        w_input = tex.inputs['W']
+        links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+        color_output = tex.outputs['Color'] if 'Color' in tex.outputs else tex.outputs['Distance']
+        
+    elif tex_type == 'WAVE':
+        tex = nodes.new('ShaderNodeTexWave')
+        tex.location = (-400, 0)
+        tex.inputs['Scale'].default_value = rand_range(1.0, 8.0)
+        tex.inputs['Distortion'].default_value = rand_range(1.0, 10.0)
+        tex.inputs['Detail'].default_value = rand_range(2.0, 6.0)
+        tex.inputs['Detail Scale'].default_value = rand_range(0.5, 3.0)
+        tex.wave_type = random.choice(['BANDS', 'RINGS'])
+        tex.wave_profile = random.choice(['SIN', 'SAW', 'TRI'])
+        # Wave uses Phase Offset for animation instead of W
+        w_input = tex.inputs['Phase Offset']
+        links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+        color_output = tex.outputs['Color']
+        
+    else:  # MUSGRAVE-like via noise with high detail
+        tex = nodes.new('ShaderNodeTexNoise')
+        tex.location = (-400, 0)
+        tex.inputs['Scale'].default_value = rand_range(1.0, 6.0)
+        tex.inputs['Detail'].default_value = rand_range(8.0, 15.0)
+        tex.inputs['Roughness'].default_value = rand_range(0.6, 1.0)
+        tex.inputs['Distortion'].default_value = rand_range(0.5, 4.0)
+        tex.noise_dimensions = '4D'
+        w_input = tex.inputs['W']
+        links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+        color_output = tex.outputs['Color']
+    
+    # Optionally add a ColorRamp for more interesting color variation (60% chance)
+    if random.random() < 0.6:
+        ramp = nodes.new('ShaderNodeValToRGB')
+        ramp.location = (-200, 0)
+        # Randomize color stops
+        cr = ramp.color_ramp
+        cr.elements[0].color = rand_color()
+        cr.elements[1].color = rand_color()
+        # Add an extra stop sometimes
+        if random.random() < 0.5:
+            elem = cr.elements.new(rand_range(0.3, 0.7))
+            elem.color = rand_color()
+        
+        # Connect fac output if available, otherwise color
+        if 'Fac' in tex.outputs:
+            links.new(tex.outputs['Fac'], ramp.inputs['Fac'])
+        else:
+            links.new(color_output, ramp.inputs['Fac'])
+        links.new(ramp.outputs['Color'], bsdf.inputs['Base Color'])
+    else:
+        links.new(color_output, bsdf.inputs['Base Color'])
+    
+    # --- ANIMATE W over timeline ---
+    scene = bpy.context.scene
+    frame_start = scene.frame_start
+    frame_end = scene.frame_end
+    
+    # W animation speed: how fast the texture morphs
+    w_speed = rand_range(0.5, 3.0)  # W units per animation duration
+    w_offset = rand_range(0, 100)    # random starting point
+    
+    w_input.default_value = w_offset
+    w_input.keyframe_insert('default_value', frame=frame_start)
+    w_input.default_value = w_offset + w_speed
+    w_input.keyframe_insert('default_value', frame=frame_end)
+    
+    # Set linear interpolation for constant speed
+    if mat.node_tree.animation_data and mat.node_tree.animation_data.action:
+        action = mat.node_tree.animation_data.action
+        if action.is_action_layered:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if hasattr(strip, 'channelbags'):
+                        for cb in strip.channelbags:
+                            for fc in cb.fcurves:
+                                for kp in fc.keyframe_points:
+                                    kp.interpolation = 'LINEAR'
+        else:
+            for fc in action.fcurves:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'LINEAR'
+    
+    # PBR properties
+    bsdf.inputs['Metallic'].default_value = rand_range(0.0, 0.5)
+    bsdf.inputs['Roughness'].default_value = rand_range(0.4, 1.0)
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = rand_range(0.0, 0.6)
+    bsdf.inputs['Alpha'].default_value = 1.0
+    if 'Transmission Weight' in bsdf.inputs:
+        bsdf.inputs['Transmission Weight'].default_value = 0.0
+    
+    return mat
+
+
+def create_random_material(name_prefix="dr_mat", base_color=None, texture_path=None, animated=False):
+    """Create a new material with randomized PBR properties.
+    
+    Args:
+        animated: If True, may use animated procedural textures (W dimension).
+    """
+    # 25% chance of animated procedural texture when animated=True
+    if animated and random.random() < 0.25:
+        return create_animated_procedural_material(name_prefix)
+    
     mat = bpy.data.materials.new(name=f"{name_prefix}_{random.randint(0, 99999)}")
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -218,9 +370,9 @@ def randomize_table_material(texture_files):
         objs = [o for o in bpy.data.objects if o.type == 'MESH' and group_filter(o)]
         if texture_files and random.random() < 0.8:
             tex = random.choice(texture_files)
-            mat = create_random_material(f"{group_name}_dr", texture_path=str(tex))
+            mat = create_random_material(f"{group_name}_dr", texture_path=str(tex), animated=True)
         else:
-            mat = create_random_material(f"{group_name}_dr")
+            mat = create_random_material(f"{group_name}_dr", animated=True)
         for obj in objs:
             obj.data.materials.clear()
             obj.data.materials.append(mat)
@@ -541,9 +693,9 @@ def add_flying_distractors(n_min, n_max, texture_files):
         if not use_usdc:
             if texture_files and random.random() < 0.6:
                 tex = random.choice(texture_files)
-                mat = create_random_material(f"distractor_{i}", texture_path=str(tex))
+                mat = create_random_material(f"distractor_{i}", texture_path=str(tex), animated=True)
             else:
-                mat = create_random_material(f"distractor_{i}")
+                mat = create_random_material(f"distractor_{i}", animated=True)
             obj.data.materials.clear()
             obj.data.materials.append(mat)
         
