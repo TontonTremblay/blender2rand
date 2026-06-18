@@ -75,6 +75,8 @@ def parse_args():
                         choices=["CYCLES", "BLENDER_EEVEE"])
     parser.add_argument("--frame_step", type=int, default=1,
                         help="Render every N frames (animation mode)")
+    parser.add_argument("--frame_end", type=int, default=-1,
+                        help="Override end frame (-1 = use scene default)")
     parser.add_argument("--n_distractors_min", type=int, default=5)
     parser.add_argument("--n_distractors_max", type=int, default=15)
     parser.add_argument("--handheld", action="store_true", default=False,
@@ -313,7 +315,12 @@ def add_random_lights():
 # ============================================================
 
 def randomize_camera(handheld=False):
-    """Randomize camera pose — critical for sim2real (MolmoBot).
+    """Randomize camera pose and intrinsics — critical for sim2real (MolmoBot).
+    
+    Intrinsics randomized around ZED camera characteristics:
+    - ZED 2: FOV ~90-110° horizontal, focal length ~2.1mm, sensor 4.8mm
+    - At 720p: fx/fy ~530-700, cx ~620-660, cy ~350-370
+    - We randomize FOV (lens), principal point (shift_x/y), and sensor size
     
     Args:
         handheld: If True, add keyframed jitter simulating handheld camera motion.
@@ -324,15 +331,31 @@ def randomize_camera(handheld=False):
     orig_loc = cam.location.copy()
     orig_rot = cam.rotation_euler.copy()
     
-    # Static offset
+    # Static offset (extrinsics)
     cam.location.x = orig_loc.x + rand_range(-0.3, 0.3)
     cam.location.y = orig_loc.y + rand_range(-0.3, 0.3)
     cam.location.z = orig_loc.z + rand_range(-0.2, 0.2)
     cam.rotation_euler.x = orig_rot.x + rand_range(-0.08, 0.08)
     cam.rotation_euler.y = orig_rot.y + rand_range(-0.08, 0.08)
     cam.rotation_euler.z = orig_rot.z + rand_range(-0.08, 0.08)
-    cam.data.lens = rand_range(25, 60)
     
+    # --- INTRINSICS (ZED-like) ---
+    # FOV / focal length: ZED 2 is ~90-110° HFOV (wide angle)
+    # In Blender, lens (mm) + sensor_width (mm) determine HFOV:
+    #   HFOV = 2 * atan(sensor_width / (2 * focal_length))
+    # ZED typical: sensor ~4.8mm, focal ~2.1mm → HFOV ~97°
+    # We randomize around this range for diversity
+    cam.data.sensor_width = rand_range(4.0, 6.0)  # mm (ZED ~4.8)
+    cam.data.lens = rand_range(1.8, 3.2)           # mm focal length (ZED ~2.1)
+    # This gives HFOV range of roughly 70° to 118°
+    
+    # Principal point offset (cx, cy shift from center)
+    # ZED cameras have slight manufacturing offset, typically 1-3% of image
+    # Blender uses shift_x/shift_y in fraction of sensor width/height
+    cam.data.shift_x = rand_range(-0.03, 0.03)  # ~±3% offset in x
+    cam.data.shift_y = rand_range(-0.03, 0.03)  # ~±3% offset in y
+    
+    # Depth of field (occasional)
     if random.random() > 0.7:
         cam.data.dof.use_dof = True
         cam.data.dof.aperture_fstop = rand_range(1.4, 8.0)
@@ -912,6 +935,8 @@ def run_animation(args, hdri_dir, texture_files):
         os.makedirs(var_dir, exist_ok=True)
         
         scene = bpy.context.scene
+        if args.frame_end > 0:
+            scene.frame_end = args.frame_end
         scene.render.filepath = os.path.join(var_dir, "frame_")
         scene.frame_step = args.frame_step
         
