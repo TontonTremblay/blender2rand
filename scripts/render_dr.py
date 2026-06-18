@@ -340,20 +340,16 @@ def randomize_camera(handheld=False):
     cam.rotation_euler.z = orig_rot.z + rand_range(-0.08, 0.08)
     
     # --- INTRINSICS (ZED-like) ---
-    # FOV / focal length: ZED 2 is ~90-110° HFOV (wide angle)
-    # In Blender, lens (mm) + sensor_width (mm) determine HFOV:
-    #   HFOV = 2 * atan(sensor_width / (2 * focal_length))
-    # ZED typical: sensor ~4.8mm, focal ~2.1mm → HFOV ~97°
-    # We randomize around this range for diversity
-    cam.data.sensor_width = rand_range(4.0, 6.0)  # mm (ZED ~4.8)
-    cam.data.lens = rand_range(1.8, 3.2)           # mm focal length (ZED ~2.1)
-    # This gives HFOV range of roughly 70° to 118°
+    # ZED 2: sensor ~4.8mm, focal ~2.12mm → HFOV ~110°
+    # Randomize within realistic unit-to-unit calibration variance (~±10%)
+    cam.data.sensor_width = rand_range(4.5, 5.1)   # mm (ZED ~4.8 ±6%)
+    cam.data.lens = rand_range(1.95, 2.35)          # mm focal length (ZED ~2.12 ±10%)
+    # This gives HFOV range of roughly 95° to 115°
     
-    # Principal point offset (cx, cy shift from center)
-    # ZED cameras have slight manufacturing offset, typically 1-3% of image
-    # Blender uses shift_x/shift_y in fraction of sensor width/height
-    cam.data.shift_x = rand_range(-0.03, 0.03)  # ~±3% offset in x
-    cam.data.shift_y = rand_range(-0.03, 0.03)  # ~±3% offset in y
+    # Principal point offset (cx, cy) — manufacturing tolerance
+    # Real ZED cameras: ~1-2% offset from center
+    cam.data.shift_x = rand_range(-0.015, 0.015)  # ~±1.5% offset
+    cam.data.shift_y = rand_range(-0.015, 0.015)  # ~±1.5% offset
     
     # Depth of field (occasional)
     if random.random() > 0.7:
